@@ -4,7 +4,7 @@ from skimage.transform import resize
 
 
 class SwinUNETRMaskGen:
-    def __init__(self, weights_path, full_size=True, device='cuda'):
+    def __init__(self, weights_path, full_size=True, device='cuda:1'):
         """
         Initialize the MaskPreparer with the model weights and device.
         
@@ -12,12 +12,13 @@ class SwinUNETRMaskGen:
         weights_path (str): Path to the model weights.
         device (str): Device to run the model on ('cuda' or 'cpu').
         """
-        self.weights = torch.load(weights_path, map_location=device)
+        print(device)
+        self.weights = torch.load(weights_path, map_location=device, weights_only=False)
         self.model = self.weights['model_arch']
         self.model.load_state_dict(self.weights['model_state_dict'])
         self.model.deep_supervision = False
         self.model.out1, self.model.out2, self.model.out3, self.model.out4 = None, None, None, None
-        self.model.to(device)
+        self.model.to('cuda:1')
         self.device = device
         self.model.eval()
         self.full_size = True
@@ -79,7 +80,7 @@ class SwinUNETRMaskGen:
             else:
                 out_mask = out_mask[:orig_img.shape[0], :orig_img.shape[1], :orig_img.shape[2]]
 
-            out_mask = self._threshold_output(out_mask, thresh=0.80)
+            out_mask = self._threshold_output(out_mask, thresh=0.60)
             out_masks.append(out_mask)
 
         out_mask = np.zeros_like(out_masks[0])

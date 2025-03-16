@@ -26,12 +26,20 @@ from threading import Thread
 import wandb
 import warnings
 warnings.filterwarnings("ignore", message=".*weights_only=False.*")
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.nn.modules.loss import _Loss
+from monai.losses.tversky import TverskyLoss
+from monai.losses.focal_loss import FocalLoss
 
 
 class SWINUNETRTrainer(object):
     def __init__(self, model=None, optimizer=None, weights=None, device='0', continue_tr = False, fold = '', dataset_dir = '', batch_size = 2, roi = True, LR = False):
 
         self.initial_lr = 0.01
+        self.min_lr = 1e-6
+        self.warmup_epochs = 5
+        self.T_0 = 20
+        self.T_mult = 2
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 500
@@ -77,17 +85,32 @@ class SWINUNETRTrainer(object):
                 self.model.load_state_dict(weights)
             
 
+        # Initialize different loss functions for different supervision levels
+        self.deep_supervision_losses = [
+            AsymmetricUnifiedFocalLoss(gamma=0.30, delta=0.7),    # Main output (doesn't have include_background)
+            DiceFocalLoss(include_background=False, sigmoid=False, gamma=2.5), # High resolution
+            TverskyLoss(include_background=False, sigmoid=False, alpha=0.25, beta=.75), # Medium resolution 
+            TverskyLoss(include_background=False, sigmoid=False, alpha=0.15, beta=.85), # Lower resolution
+            TverskyLoss(include_background=False, sigmoid=False, alpha=0.05, beta=.95), # Low resolution
+            FocalLoss(include_background=False, weight=[0.4, 1], gamma=2)    # Lowest resolution
+        ]
+
+        # Initialize weights that will be dynamically adjusted
         if self.enable_deep_supervision:
             self.weights = np.array([1/(2.5**i) for i in range(6)])
-            #reverse
-            self.weights[-1] = 0
+            self.weights[-1] = 0  # Zero out the last weight as before
             self.weights = self.weights/self.weights.sum()
 
         self.criterion = DiceLoss(include_background=False, sigmoid=True)
 
         self.lr = self.optimizer.param_groups[0]['lr']
 
-        self.lr_scheduler = PolyLRScheduler(self.optimizer, initial_lr=self.lr, max_steps=self.num_epochs*self.num_iterations_per_epoch//256, exponent=0.9, current_step=self.current_epoch*self.num_iterations_per_epoch//256) 
+        self.lr_scheduler = CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=self.T_0,
+            T_mult=self.T_mult,
+            eta_min=self.min_lr
+        )
             
     def load_most_recent_checkpoint(self, fold_dir):
         #check for pt file 
@@ -95,7 +118,7 @@ class SWINUNETRTrainer(object):
         #if pt file exists, load the model and optimizer state
 
         if os.path.exists(os.path.join(fold_dir, 'checkpoint.pt')):
-            checkpoint = torch.load(os.path.join(fold_dir, 'checkpoint.pt'))
+            checkpoint = torch.load(os.path.join(fold_dir, 'checkpoint.pt'), weights_only=False)
             self.model = checkpoint['model_arch']
             self.optimizer = checkpoint['optimizer']
             self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -157,6 +180,9 @@ class SWINUNETRTrainer(object):
         sys.stdout = log_file
 
         files = os.listdir(self.dataset_dir)
+        val_files = os.listdir(self.dataset_dir.replace('train', 'validate'))
+        # add val files to files since we are doing kfold cross validation on the train set
+        files.extend(val_files)
 
         files = np.array(files, dtype=str) # operation results in nonetype
 
@@ -175,10 +201,12 @@ class SWINUNETRTrainer(object):
 
         train_files = [self.dataset_dir + file for file in train_files]
         val_files = [self.dataset_dir + file for file in val_files]
+        # add val files to train files
+        train_files.extend(val_files)
 
 
-        test_files = os.listdir(self.dataset_dir.replace('Tr', 'Ts'))
-        test_files = [self.dataset_dir.replace('Tr', 'Ts') + file for file in test_files]
+        test_files = os.listdir(self.dataset_dir.replace('train', 'test'))
+        test_files = [self.dataset_dir.replace('train', 'test') + file for file in test_files]
 
         train_loader = CustomDataLoader(train_files, batch_size=self.batch_size, LR=self.LR)
         #val_loader = CustomDataLoader(val_files, batch_size=1, val=True, LR=self.LR) # not using val loader because we more care about the test set
@@ -260,7 +288,7 @@ class SWINUNETRTrainer(object):
             for i in range(inputs.shape[0]):
                 new_inputs[i], new_labels[i] = crop(inputs[i:i+1], labels[i:i+1], patch, crop_type='random')
 
-            return torch.from_numpy(new_inputs).float().cuda(0), torch.from_numpy(new_labels).float().cuda(0)
+            return torch.from_numpy(new_inputs).float().cuda(self.device), torch.from_numpy(new_labels).float().cuda(self.device)
         
         # select randomly factors that are less than or equal to the min
         possible_x = [factor for factor in self.divis_x if factor <= factors_x]
@@ -307,6 +335,20 @@ class SWINUNETRTrainer(object):
         log_thread.start()
         log_thread.join()
 
+    def get_lr(self, epoch):
+        # Implement warmup
+        if epoch < self.warmup_epochs:
+            return self.initial_lr * ((epoch + 1) / self.warmup_epochs)
+        return self.lr_scheduler.get_last_lr()[0]
+
+    def adjust_learning_rate(self, epoch):
+        if epoch < self.warmup_epochs:
+            lr = self.get_lr(epoch)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            self.lr_scheduler.step()
+
     def train_model(self):
         self.train_loader.restart()
         self.test_loader.restart()
@@ -319,7 +361,7 @@ class SWINUNETRTrainer(object):
         '''criterion.lambda_focal = 1
         criterion.lambda_dice = 1'''
         #clean_criterion = torch.nn.MSELoss()
-        calc_criterion = DiceLoss(include_background=False, sigmoid=False, to_onehot_y=False, squared_pred=True).requires_grad_(False)
+        calc_criterion = DiceLoss(include_background=False, sigmoid=False, to_onehot_y=False, squared_pred=True)
 
         # login
         wandb.login()
@@ -357,11 +399,19 @@ class SWINUNETRTrainer(object):
                 inputs = data['data']
                 #roi = data['seg'][:, 1:]
                 labels = data['seg'] # this was changed to support onehot
+                for data in inputs:
+                    if data.shape[1] < 32:
+                        continue
+                    if data.shape[2] < 32:
+                        continue
+                    if data.shape[3] < 32:
+                        continue
 
-                inputs, labels = inputs.cuda(), labels.cuda()
+
+                inputs, labels = inputs.cuda(self.device), labels.cuda(self.device)
 
                 if (i+1) % 256 == 0:
-                    self.lr_scheduler.step()
+                    self.adjust_learning_rate(epoch)
                     print(f'Learning rate: {self.optimizer.param_groups[0]["lr"]}', flush=True)
 
                 if labels[0].max() == 0:
@@ -375,47 +425,96 @@ class SWINUNETRTrainer(object):
 
                 if self.enable_deep_supervision:
                     logits = outputs
+                    total_valid_layers = 0
+                    layer_weights = []
+                    
+                    # First pass: check which layers have valid labels
                     for j, logit in enumerate(logits):
                         if j != 0:
                             down_labels = F.interpolate(labels, size=logit.shape[2:], mode='nearest')
                         else:
                             down_labels = labels
+                        
+                        # Layer is valid if it has any valid labels
+                        if down_labels.sum() > 0:
+                            total_valid_layers += 1
+                            layer_weights.append(self.weights[j])
+                            # Keep track of the most recent valid layer
+                            last_valid_layer = j
+                        else:
+                            layer_weights.append(0.0)
+                    
+                    # Normalize weights for valid layers
+                    if total_valid_layers > 0:
+                        layer_weights = np.array(layer_weights)
+                        # Simply normalize the weights - keep all valid layers
+                        layer_weights = layer_weights / (layer_weights.sum() + 1e-8)
+                    
+                        # Second pass: calculate losses only for valid layers
+                        for j, logit in enumerate(logits):
+                            if layer_weights[j] == 0:
+                                continue
+                                
+                            if j != 0:
+                                down_labels = F.interpolate(labels, size=logit.shape[2:], mode='nearest')
+                            else:
+                                down_labels = labels
+                            
+                            # Since we're not including background in loss calculation,
+                            # we don't need to create complement labels
+                            temp_logit = F.sigmoid(logit)
+                            
+                            # Use the appropriate loss function for this level
+                            if j == 0:
+                                temp_logit = torch.cat((1 - temp_logit, temp_logit), 1)
+                                down_labels = torch.cat((1 - down_labels, down_labels), 1)
+                            current_loss = self.deep_supervision_losses[j](temp_logit, down_labels)
+                            temp_loss += layer_weights[j] * current_loss
+                            
+                            # Log individual layer losses
+                            wandb.log({
+                                f'layer_{j}_loss': current_loss.item(),
+                                f'layer_{j}_weight': layer_weights[j]
+                            })
+                    else:
+                        # If no valid layers, use only the main output
 
-                        complement_labels = 1 - down_labels
-                        down_labels = torch.cat((complement_labels, down_labels), 1)
+                        temp_logit = F.sigmoid(logits[0])
+                        temp_complement = 1 - temp_logit
+                        temp_logit = torch.cat((temp_complement, temp_logit), 1)
+                        labels_complement = 1 - labels
+                        labels = torch.cat((labels_complement, labels), 1)
+                        print(temp_logit.shape, labels.shape)
+                        temp_loss = self.deep_supervision_losses[0](temp_logit, labels)
+                        del temp_logit
+                        del temp_complement
+                        del labels_complement
+                        del labels
 
-                        temp_logit = F.sigmoid(logit)
-                        complement_logit = 1 - temp_logit
-                        logit = torch.cat((complement_logit, temp_logit), 1)
-
-                        temp_loss += self.weights[j] * criterion(logit, down_labels)
-
+                    # Calculate final output loss for monitoring
                     out = F.sigmoid(outputs[0])
-                    complement = 1 - out
-                    out = torch.cat((complement, out), 1)
-                    complement_labels = 1 - labels
-                    labels = torch.cat((complement_labels, labels), 1)
-                    temp_calc_loss += calc_criterion(out, labels)
+                    temp_calc_loss = calc_criterion(out, labels)
                     outputs = outputs[0]
                 else:
                     temp_output = F.sigmoid(outputs)
-                    complement = 1 - temp_output
-                    outputs = torch.cat((complement, temp_output), 1)
-                    complement = 1 - labels
-                    labels = torch.cat((complement, labels), 1)
-                    temp_loss += criterion(outputs[:, :, ...], labels[:, :, ...])
-                    temp_calc_loss += calc_criterion(outputs[:, :, ...], labels[:, :, ...])
-
+                    temp_loss = criterion(temp_output, labels)
+                    temp_calc_loss = calc_criterion(temp_output, labels)
+                
                 temp_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+
                 
                 loss_total += temp_loss.detach().mean()
-                dice_total += temp_calc_loss.detach().mean()
+                dice_total += temp_calc_loss.mean()
                 num_iter += 1
                 if self.enable_deep_supervision:
                     self.async_log(temp_loss, temp_calc_loss)
                 else:
                     wandb.log({'train loss': temp_loss.mean().item(), 'train dice loss': temp_loss.mean().item()})
+                del temp_logit
+                del temp_calc_loss
+                
 
             print(f"Train {epoch} took {time.time() - t1} seconds", flush=True)
 
@@ -441,7 +540,7 @@ class SWINUNETRTrainer(object):
                     if labels[0].max() == 0:
                         continue
 
-                    inputs, labels = inputs.cuda(), labels.cuda()
+                    inputs, labels = inputs.cuda(self.device), labels.cuda(self.device)
 
                     outputs = self.model(inputs)
 

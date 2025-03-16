@@ -50,3 +50,27 @@ wandb/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# pytorch
+*.pt
+*.pth
+*.pth.tar
+*.pth.tar.gz
+*.pth.tar.xz
+*.pth.tar.bz2
+*.pth.tar.lzma
+
+#numpy
+*.npy
+*.npz
+*.npz.gz
+*.npz.xz
+*.npz.bz2
+*.npz.lzma
+
+# txt
+*.txt
+*.txt.gz
+*.txt.xz
+*.txt.bz2
+*.txt.lzma

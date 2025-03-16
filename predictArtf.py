@@ -3,10 +3,10 @@ from SwinUNeTRGen import SwinUNETRMaskGen
 import numpy as np
 
 def predict(model, LR=False, use_roi=True, fold=0):
-    maskGen = SwinUNETRMaskGen(f"/home/nathan/Desktop/SWINUNETR_ARTF/{model}/fold_{fold}/checkpoint_best.pt", device='cuda', full_size=True)
-    true_artf = os.listdir("/raid/trueArtifacts_updated")
+    maskGen = SwinUNETRMaskGen(f"/home/user/Nathan/Desktop/SWINUNETR_ARTF/{model}/fold_{fold}/checkpoint_best.pt", device='cuda:1', full_size=True)
+    true_artf = os.listdir("/raid/trueArtifacts")
 
-    true_arts = [img for img in true_artf if "CTinhaleArtf" in img]
+    true_arts = [img for img in true_artf if "image" in img]
     if use_roi:
         if LR:
             true_rois = [roi for roi in true_artf if "maskArtifactROI_R" in roi]
@@ -23,21 +23,21 @@ def predict(model, LR=False, use_roi=True, fold=0):
             true_rois = temp
 
     for i in range(len(true_arts)):
-        img = np.load("/raid/trueArtifacts_updated/" + true_arts[i])
+        img = np.load("/raid/trueArtifacts/" + true_arts[i])
         if use_roi:
             if type(true_rois[i]) == tuple:
-                roi1 = np.load("/raid/trueArtifacts_updated/" + true_rois[i][0])
-                roi2 = np.load("/raid/trueArtifacts_updated/" + true_rois[i][1])
+                roi1 = np.load("/raid/trueArtifacts/" + true_rois[i][0])
+                roi2 = np.load("/raid/trueArtifacts/" + true_rois[i][1])
                 roi = (roi1, roi2)
             else:
-                roi = np.load("/raid/trueArtifacts_updated/" + true_rois[i])
+                roi = np.load("/raid/trueArtifacts/" + true_rois[i])
         else:
             roi = np.ones_like(img)
         
         mask1 = maskGen(img, roi, roi)
-
+        model = model.split("_")[-1]
         os.makedirs(f"/raid/trueArtifacts{model}{fold}", exist_ok=True)
-        np.save(f"/raid/trueArtifacts{model}{fold}/" + true_arts[i].replace("CTinhaleArtf", "predMask"), mask1)
+        np.savez_compressed(f"/raid/trueArtifacts{model}{fold}/" + true_arts[i].replace("image", "predMask").replace(".npy", ""), mask1)
 
 if __name__ == "__main__":
     import argparse

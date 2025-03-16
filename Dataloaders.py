@@ -22,6 +22,45 @@ class CustomDataLoader(DataLoader):
             data = np.load(data_name).astype(np.float32)
             seg = np.load(seg_name.replace("CTinhaleArtf", "maskArtifact")).astype(np.float32)
             roi = np.load(data_name.replace("CTinhaleArtf", "maskArtifactROI")).astype(np.float32)
+        if ".npz" in data_name:
+            if "image" in data_name:
+                pass
+            elif "maskArtifactROI_R" in data_name or "maskArtifactROI_L" in data_name:
+                data_name = data_name.replace("maskArtifactROI_R", "image").replace("maskArtifactROI_L", "image")
+            elif "maskArtifactROI" in data_name:
+                data_name = data_name.replace("maskArtifactROI", "image")
+            elif "maskArtifact" in data_name:
+                data_name = data_name.replace("maskArtifact", "image")
+            else:
+                raise ValueError(f"Unknown data name: {data_name}")
+            #try loading with train if that fails load with validate, if that fails try with test
+            try:
+                data = np.load(data_name)['arr_0']
+                replace = "train"
+            except:
+                try:
+                    data = np.load(data_name.replace("train", "validate"))['arr_0']
+                    replace = "validate"
+                except:
+                    data = np.load(data_name.replace("train", "test"))['arr_0']
+                    replace = "test"
+
+            if self.LR:
+                if np.random.rand() > 0.5:
+                    roi_name = data_name.replace('image', 'maskArtifactROI_R')
+                else:
+                    roi_name = data_name.replace('image', 'maskArtifactROI_L')
+
+                seg_name = data_name.replace('image', 'maskArtifact')
+                roi_name = roi_name.replace("train", replace)
+                seg_name = seg_name.replace("train", replace)
+            else:
+                roi_name = data_name.replace('image', 'maskArtifactROI')
+                seg_name = data_name.replace('image', 'maskArtifact')
+                roi_name = roi_name.replace("train", replace)
+                seg_name = seg_name.replace("train", replace)
+            seg = np.load(seg_name)['arr_0']
+            roi = np.load(roi_name)['arr_0']
         else:
             data = torch.load(data_name)
             seg = torch.load(seg_name)
@@ -121,7 +160,11 @@ class CustomDataLoader(DataLoader):
         idx = self.get_indices()
         data_names = [self.data_names[i] for i in idx]
         if self.val:
-            temp_data, temp_seg, temp_roi = self.load_data(data_names[0], data_names[0].replace('_0000', '').replace('images', 'labels'))
+            temp_data, temp_seg, temp_roi = self.load_data(data_names[0], data_names[0].replace('_0000', '').replace('images', 'labels').replace('_image', ''))
+            temp_seg[temp_seg == 2] = 1
+            temp_seg[temp_seg == 3] = 0
+            temp_seg[temp_seg == 4] = 0
+
             temp_data = np.expand_dims(temp_data, axis=(0, 1))
             temp_seg = np.expand_dims(temp_seg, axis=(0, 1))
             temp_roi = np.expand_dims(temp_roi, axis=(0, 1))
@@ -131,7 +174,11 @@ class CustomDataLoader(DataLoader):
         rois = []
 
         for data_name in data_names:
-            temp_data, temp_seg, temp_roi = self.load_data(data_name, data_name.replace('_0000', '').replace('images', 'labels'))
+            temp_data, temp_seg, temp_roi = self.load_data(data_name, data_name.replace('_0000', '').replace('images', 'labels').replace('_image', ''))
+            temp_seg[temp_seg == 2] = 1
+            temp_seg[temp_seg == 3] = 0
+            temp_seg[temp_seg == 4] = 0
+
             temp_data = np.expand_dims(temp_data, axis=(0, 1))
             temp_seg = np.expand_dims(temp_seg, axis=(0, 1))
             temp_roi = np.expand_dims(temp_roi, axis=(0, 1))
