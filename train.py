@@ -946,10 +946,20 @@ class SWINUNETRTrainer(object):
                     if self.enable_deep_supervision:
                         outputs = outputs[0]
                     
-                    labels = torch.cat((1-labels, labels), 1)
-                    temp_output = F.sigmoid(outputs)
-                    complement = 1 - temp_output
-                    outputs = torch.cat((complement, temp_output), 1)
+                    temp_logit = F.softmax(outputs, dim=1)
+                    label_1 = labels == 1
+                    label_2 = labels == 2
+                    labels_1_tensor = label_1.long()
+                    labels_2_tensor = label_2.long()
+
+                    bg_channel = 1 - temp_logit[:, 1:2] - temp_logit[:, 2:3]
+                    temp_logit_cat = torch.cat((bg_channel, temp_logit[:, 1:2], temp_logit[:, 2:3]), 1)
+                    
+                    bg_mask = 1 - labels_1_tensor - labels_2_tensor
+                    down_labels_cat = torch.cat((bg_mask, labels_1_tensor, labels_2_tensor), 1)
+
+                    outputs = temp_logit_cat
+                    labels = down_labels_cat
 
                     temp_loss_calc = calc_criterion(outputs, labels)
 
