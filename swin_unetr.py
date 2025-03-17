@@ -254,9 +254,9 @@ class SwinUNETR(nn.Module):
             res_block=True,
         )
 
-        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
+        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels+2)
         if self.deep_supervision:
-            self.out1 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
+            self.out1 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels+2)
             self.out2 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size*2, out_channels=out_channels)
             self.out3 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size*4, out_channels=out_channels)
             self.out4 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size*8, out_channels=out_channels)

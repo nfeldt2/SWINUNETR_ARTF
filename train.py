@@ -31,10 +31,70 @@ from torch.nn.modules.loss import _Loss
 from monai.losses.tversky import TverskyLoss
 from monai.losses.focal_loss import FocalLoss
 
+# Add memory tracking utilities
+def get_gpu_memory_usage(device=None):
+    """Return GPU memory usage in MB for a specific device"""
+    if torch.cuda.is_available():
+        if device is None:
+            # Get memory for all devices
+            memory_stats = {}
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(i)
+                memory_stats[f"GPU {i}"] = torch.cuda.memory_allocated(i) / 1024 / 1024
+            return memory_stats
+        else:
+            # Get memory for specific device
+            device_idx = device if isinstance(device, int) else int(device.split(':')[-1])
+            torch.cuda.synchronize(device_idx)
+            return torch.cuda.memory_allocated(device_idx) / 1024 / 1024
+    return 0
+
+def get_tensor_size_mb(tensor):
+    """Return tensor size in MB"""
+    if tensor is None:
+        return 0
+    
+    # Handle tuple or list of tensors
+    if isinstance(tensor, (tuple, list)):
+        return sum(get_tensor_size_mb(t) for t in tensor)
+    
+    # Handle regular tensor
+    return tensor.element_size() * tensor.nelement() / 1024 / 1024
+
+def log_memory_usage(tag, tensors_dict=None, device=None, verbose=True):
+    """Log memory usage and tensor sizes"""
+    memory_usage = get_gpu_memory_usage(device)
+    
+    if verbose:
+        if isinstance(memory_usage, dict):
+            # Multiple GPUs
+            log_str = f"[{tag}] GPU Memory: " + ", ".join([f"{k}: {v:.2f} MB" for k, v in memory_usage.items()])
+        else:
+            # Single GPU
+            log_str = f"[{tag}] GPU Memory: {memory_usage:.2f} MB"
+        
+        if tensors_dict:
+            log_str += " | Tensors: "
+            for name, tensor in tensors_dict.items():
+                if tensor is not None:
+                    size_mb = get_tensor_size_mb(tensor)
+                    
+                    # Handle shape display for different types
+                    if isinstance(tensor, (tuple, list)):
+                        shape_str = "[" + ", ".join(f"{t.shape}" for t in tensor) + "]"
+                    else:
+                        shape_str = 'x'.join(str(dim) for dim in tensor.shape)
+                    
+                    log_str += f"{name}({shape_str}): {size_mb:.2f}MB, "
+        
+        print(log_str, flush=True)
+    
+    return memory_usage
 
 class SWINUNETRTrainer(object):
-    def __init__(self, model=None, optimizer=None, weights=None, device='0', continue_tr = False, fold = '', dataset_dir = '', batch_size = 2, roi = True, LR = False):
-
+    def __init__(self, model=None, optimizer=None, weights=None, device='0', continue_tr = False, fold = '', dataset_dir = '', batch_size = 2, roi = True, LR = False, verbose=True):
+        # Add verbose parameter to control logging verbosity
+        self.verbose = verbose
         self.initial_lr = 0.01
         self.min_lr = 1e-6
         self.warmup_epochs = 5
@@ -55,9 +115,9 @@ class SWINUNETRTrainer(object):
         self.continue_tr = continue_tr
         self.batch_size = batch_size
         self.divis_x = [2]
-        self.divis_y = [5, 6, 7, 8]
-        self.divis_z = [5, 6, 7, 8, 9, 10]
-        self.max_dims = [4, 10, 13]
+        self.divis_y = [5, 6, 7]
+        self.divis_z = [5, 6, 7, 8, 9]
+        self.max_dims = [3, 7, 10]
         self.num_accumulation = 4
         self.roi = roi
         self.LR = LR
@@ -87,11 +147,11 @@ class SWINUNETRTrainer(object):
 
         # Initialize different loss functions for different supervision levels
         self.deep_supervision_losses = [
-            AsymmetricUnifiedFocalLoss(gamma=0.30, delta=0.7),    # Main output (doesn't have include_background)
-            DiceFocalLoss(include_background=False, sigmoid=False, gamma=2.5), # High resolution
-            TverskyLoss(include_background=False, sigmoid=False, alpha=0.25, beta=.75), # Medium resolution 
-            TverskyLoss(include_background=False, sigmoid=False, alpha=0.15, beta=.85), # Lower resolution
-            TverskyLoss(include_background=False, sigmoid=False, alpha=0.05, beta=.95), # Low resolution
+            DiceFocalLoss(include_background=False, sigmoid=False, gamma=5, squared_pred=True, batch=True),    # Main output (doesn't have include_background)
+            DiceFocalLoss(include_background=False, sigmoid=False, gamma=5, squared_pred=True, batch=True), # High resolution
+            TverskyLoss(include_background=False, sigmoid=False, alpha=0.02, beta=.98, batch=True), # Medium resolution 
+            TverskyLoss(include_background=False, sigmoid=False, alpha=0.02, beta=.98), # Lower resolution
+            TverskyLoss(include_background=False, sigmoid=False, alpha=0.02, beta=.98), # Low resolution
             FocalLoss(include_background=False, weight=[0.4, 1], gamma=2)    # Lowest resolution
         ]
 
@@ -322,18 +382,33 @@ class SWINUNETRTrainer(object):
         train_loader.generator.shuffle_indices()
         return train_loader
 
-    def log_metrics(self, loss, calc_loss, split):
+    def async_log(self, loss, calc_loss, split='train'):
+        # Extract scalar values to avoid tensor references
         loss_value = loss.detach().cpu().mean().item()
         calc_loss_value = calc_loss.detach().cpu().mean().item()
+        
+        # Create a dictionary of metrics to log
         if split == 'val':
             metrics = {'Test loss': loss_value, 'Test dice loss': calc_loss_value}
-        metrics = {'Train loss': loss_value, 'Train dice loss': calc_loss_value}
-        wandb.log(metrics)
-    
-    def async_log(self, loss, calc_loss, split='train'):
-        log_thread = Thread(target=self.log_metrics, args=(loss, calc_loss, split,))
+        else:
+            metrics = {'Train loss': loss_value, 'Train dice loss': calc_loss_value}
+        
+        # Use a thread to log the metrics
+        def log_thread_fn(metrics_dict):
+            try:
+                wandb.log(metrics_dict)
+            except Exception as e:
+                print(f"Error in wandb logging: {e}")
+            finally:
+                # Ensure the dictionary is deleted
+                del metrics_dict
+        
+        log_thread = Thread(target=log_thread_fn, args=(metrics.copy(),))
+        log_thread.daemon = True  # Make thread daemon so it doesn't prevent program exit
         log_thread.start()
-        log_thread.join()
+        
+        # Delete our copies to ensure we don't keep references
+        del loss_value, calc_loss_value, metrics
 
     def get_lr(self, epoch):
         # Implement warmup
@@ -361,7 +436,7 @@ class SWINUNETRTrainer(object):
         '''criterion.lambda_focal = 1
         criterion.lambda_dice = 1'''
         #clean_criterion = torch.nn.MSELoss()
-        calc_criterion = DiceLoss(include_background=False, sigmoid=False, to_onehot_y=False, squared_pred=True)
+        calc_criterion = DiceLoss(include_background=False, sigmoid=False, to_onehot_y=False)
 
         # login
         wandb.login()
@@ -386,142 +461,466 @@ class SWINUNETRTrainer(object):
             self.model.train()
             t1 = time.time()
             for i in range(self.num_iterations_per_epoch):
-                self.optimizer.zero_grad()
+                try:
+                    self.optimizer.zero_grad()
 
-                data = next(self.train_loader)
+                    data = next(self.train_loader)
 
-                if 'S1' in self.dataset_dir and (i + 1) % 250 == 0 and i < 300:
-                    # creat copy of train loader
-                    self.train_loader.restart()
-                    self.train_loader.generator.shuffle_indices()
-                
-
-                inputs = data['data']
-                #roi = data['seg'][:, 1:]
-                labels = data['seg'] # this was changed to support onehot
-                for data in inputs:
-                    if data.shape[1] < 32:
-                        continue
-                    if data.shape[2] < 32:
-                        continue
-                    if data.shape[3] < 32:
-                        continue
-
-
-                inputs, labels = inputs.cuda(self.device), labels.cuda(self.device)
-
-                if (i+1) % 256 == 0:
-                    self.adjust_learning_rate(epoch)
-                    print(f'Learning rate: {self.optimizer.param_groups[0]["lr"]}', flush=True)
-
-                if labels[0].max() == 0:
-                    print("skipping...")
-                    continue
-
-                outputs = self.model(inputs)
-
-                temp_loss = 0
-                temp_calc_loss = 0
-
-                if self.enable_deep_supervision:
-                    logits = outputs
-                    total_valid_layers = 0
-                    layer_weights = []
+                    if 'S1' in self.dataset_dir and (i + 1) % 250 == 0 and i < 300:
+                        # creat copy of train loader
+                        self.train_loader.restart()
+                        self.train_loader.generator.shuffle_indices()
                     
-                    # First pass: check which layers have valid labels
-                    for j, logit in enumerate(logits):
-                        if j != 0:
-                            down_labels = F.interpolate(labels, size=logit.shape[2:], mode='nearest')
-                        else:
-                            down_labels = labels
+                    # Record file information for debugging
+                    file_info = {}
+                    if 'file_path' in data:
+                        file_info['file_path'] = data['file_path']
+                    if 'file_name' in data:
+                        file_info['file_name'] = data['file_name']
+                    
+                    inputs = data['data']
+                    #roi = data['seg'][:, 1:]
+                    labels = data['seg'] # this was changed to support onehot
+                    
+                    # Log memory usage and tensor sizes before processing
+                    log_memory_usage(f"Iteration {i} - Before processing", {
+                        "inputs": inputs,
+                        "labels": labels
+                    }, device=self.device, verbose=self.verbose)
+                    
+                    # Log file and shape information
+                    if self.verbose:
+                        shape_info = f"Input shape: {inputs.shape}, Labels shape: {labels.shape}"
+                        file_info_str = ""
+                        if 'file_info' in locals() and file_info:
+                            file_info_str = ", ".join([f"{k}: {v}" for k, v in file_info.items()])
                         
-                        # Layer is valid if it has any valid labels
-                        if down_labels.sum() > 0:
-                            total_valid_layers += 1
-                            layer_weights.append(self.weights[j])
-                            # Keep track of the most recent valid layer
-                            last_valid_layer = j
-                        else:
-                            layer_weights.append(0.0)
+                        print(f"Iteration {i} - {shape_info} - {file_info_str}", flush=True)
                     
-                    # Normalize weights for valid layers
-                    if total_valid_layers > 0:
-                        layer_weights = np.array(layer_weights)
-                        # Simply normalize the weights - keep all valid layers
-                        layer_weights = layer_weights / (layer_weights.sum() + 1e-8)
+                    # Track largest tensors seen so far
+                    if not hasattr(self, 'largest_input_shape'):
+                        self.largest_input_shape = inputs.shape
+                        self.largest_input_file = file_info if 'file_info' in locals() else None
+                    elif np.prod(inputs.shape) > np.prod(self.largest_input_shape):
+                        self.largest_input_shape = inputs.shape
+                        self.largest_input_file = file_info if 'file_info' in locals() else None
+                        if self.verbose:
+                            print(f"New largest input: {self.largest_input_shape} from {self.largest_input_file}", flush=True)
                     
-                        # Second pass: calculate losses only for valid layers
+                    for data in inputs:
+                        if data.shape[1] < 32:
+                            continue
+                        if data.shape[2] < 32:
+                            continue
+                        if data.shape[3] < 32:
+                            continue
+
+
+                    inputs, labels = inputs.cuda(self.device), labels.cuda(self.device)
+                    
+                    # Log memory after moving to GPU
+                    log_memory_usage(f"Iteration {i} - After moving to GPU", device=self.device, verbose=self.verbose)
+
+                    if (i+1) % 256 == 0:
+                        self.adjust_learning_rate(epoch)
+                        if self.verbose:
+                            print(f'Learning rate: {self.optimizer.param_groups[0]["lr"]}', flush=True)
+
+                    if labels[0].max() == 0:
+                        if self.verbose:
+                            print("skipping...")
+                        continue
+
+                    outputs = self.model(inputs)
+                    
+                    # Log memory after forward pass
+                    log_memory_usage(f"Iteration {i} - After forward pass", {
+                        "outputs": outputs
+                    }, device=self.device, verbose=self.verbose)
+
+                    temp_loss = 0
+                    temp_calc_loss = 0
+
+                    if self.enable_deep_supervision:
+                        logits = outputs
+                        total_valid_layers = 0
+                        layer_weights = []
+                        
+                        # Log memory at start of deep supervision
+                        log_memory_usage(f"Iteration {i} - Start of deep supervision", {
+                            "logits": logits
+                        }, device=self.device, verbose=self.verbose)
+                        
+                        # First pass: check which layers have valid labels
                         for j, logit in enumerate(logits):
-                            if layer_weights[j] == 0:
-                                continue
-                                
                             if j != 0:
                                 down_labels = F.interpolate(labels, size=logit.shape[2:], mode='nearest')
                             else:
                                 down_labels = labels
                             
-                            # Since we're not including background in loss calculation,
-                            # we don't need to create complement labels
-                            temp_logit = F.sigmoid(logit)
+                            # Layer is valid if it has any valid labels
+                            if down_labels.sum() > 0:
+                                total_valid_layers += 1
+                                layer_weights.append(self.weights[j])
+                                # Keep track of the most recent valid layer
+                                last_valid_layer = j
+                            else:
+                                layer_weights.append(0.0)
                             
-                            # Use the appropriate loss function for this level
-                            if j == 0:
-                                temp_logit = torch.cat((1 - temp_logit, temp_logit), 1)
-                                down_labels = torch.cat((1 - down_labels, down_labels), 1)
-                            current_loss = self.deep_supervision_losses[j](temp_logit, down_labels)
-                            temp_loss += layer_weights[j] * current_loss
+                            # Clean up intermediate tensors
+                            if j != 0:
+                                del down_labels
+                        
+                        # Normalize weights for valid layers
+                        if total_valid_layers > 0:
+                            layer_weights = np.array(layer_weights)
+                            # Simply normalize the weights - keep all valid layers
+                            layer_weights = layer_weights / (layer_weights.sum() + 1e-8)
+                        
+                            # Second pass: calculate losses only for valid layers
+                            for j, logit in enumerate(logits):
+                                if layer_weights[j] == 0:
+                                    continue
+                                    
+                                if j != 0:
+                                    down_labels = F.interpolate(labels, size=logit.shape[2:], mode='nearest')
+                                else:
+                                    down_labels = labels
+                                
+                                # Since we're not including background in loss calculation,
+                                # we don't need to create complement labels
+                                
+                                # Use the appropriate loss function for this level
+                                if j != 0 and j != 1:
+                                    temp_logit = F.sigmoid(logit)
+                                    # how do i make this equal to 1 instead of boolean
+                                    labels_1 = down_labels == 1 
+                                    labels_2 = down_labels == 2
+                                    down_labels_tensor = labels_1 + labels_2
+                                    down_labels_tensor = down_labels_tensor.long()
+                                    temp_complement = 1 - temp_logit
+                                    temp_logit_cat = torch.cat((temp_complement, temp_logit), 1)
+                                    down_labels_complement = 1 - down_labels_tensor
+                                    down_labels_cat = torch.cat((down_labels_complement, down_labels_tensor), 1)
+                                    
+                                    current_loss = self.deep_supervision_losses[j](temp_logit_cat, down_labels_cat)
+                                    temp_loss += layer_weights[j] * current_loss
+
+                                    # Store loss value as a Python scalar, not a tensor
+                                    loss_value = current_loss.item()
+                                    # Log individual layer losses outside the loop to prevent memory leaks
+                                    wandb.log({
+                                        f'layer_{j}_loss': loss_value,
+                                        f'layer_{j}_weight': layer_weights[j]
+                                    })
+                                    
+                                    # Clean up intermediate tensors
+                                    del temp_logit, temp_complement, temp_logit_cat
+                                    del labels_1, labels_2, down_labels_tensor
+                                    del down_labels_complement, down_labels_cat
+                                    del current_loss, loss_value  # Also delete the loss tensor and value
+                                else:
+                                    # three classes (including background)
+                                    temp_logit = F.softmax(logit, dim=1)
+                                    # when down labels are 1
+                                    labels_1 = down_labels == 1
+                                    labels_2 = down_labels == 2
+                                    labels_1_tensor = labels_1.long()
+                                    labels_2_tensor = labels_2.long()
+                                    
+                                    bg_channel = 1 - temp_logit[:, 1:2] - temp_logit[:, 2:3]
+                                    temp_logit_cat = torch.cat((bg_channel, temp_logit[:, 1:2], temp_logit[:, 2:3]), 1)
+                                    
+                                    bg_mask = 1 - labels_1_tensor - labels_2_tensor
+                                    down_labels_cat = torch.cat((bg_mask, labels_1_tensor, labels_2_tensor), 1)
+                                    
+                                    current_loss = self.deep_supervision_losses[j](temp_logit_cat, down_labels_cat)
+                                    temp_loss += layer_weights[j] * current_loss
+                                    
+                                    # Store loss value as a Python scalar, not a tensor
+                                    loss_value = current_loss.item()
+                                    # Log individual layer losses outside the loop to prevent memory leaks
+                                    wandb.log({
+                                        f'layer_{j}_loss': loss_value,
+                                        f'layer_{j}_weight': layer_weights[j]
+                                    })
+                                    
+                                    # Clean up intermediate tensors
+                                    del temp_logit, temp_logit_cat
+                                    del labels_1, labels_2, labels_1_tensor, labels_2_tensor
+                                    del bg_channel, bg_mask, down_labels_cat
+                                    del current_loss, loss_value  # Also delete the loss tensor and value
+                                
+                                # Clean up per-iteration tensors
+                                if j != 0:
+                                    del down_labels
+                                
+                        else:
+                            # If no valid layers, use only the main output
+                            temp_logit = F.sigmoid(logits[0])
+                            temp_complement = 1 - temp_logit
+                            temp_logit_cat = torch.cat((temp_complement, temp_logit), 1)
+                            labels_complement = 1 - labels
+                            labels_cat = torch.cat((labels_complement, labels), 1)
+                            temp_loss = self.deep_supervision_losses[0](temp_logit_cat, labels_cat)
                             
-                            # Log individual layer losses
-                            wandb.log({
-                                f'layer_{j}_loss': current_loss.item(),
-                                f'layer_{j}_weight': layer_weights[j]
-                            })
+                            # Clean up intermediate tensors
+                            del temp_logit, temp_complement, temp_logit_cat
+                            del labels_complement, labels_cat
+
+                        # Calculate final output loss for monitoring
+                        out = F.softmax(outputs[0], dim=1)
+                        labels_1 = labels == 1
+                        labels_2 = labels == 2
+                        labels_1_tensor = labels_1.long()
+                        labels_2_tensor = labels_2.long()
+                        bg_mask = 1 - labels_1_tensor - labels_2_tensor
+                        labels_cat = torch.cat((bg_mask, labels_1_tensor, labels_2_tensor), 1)
+
+                        temp_calc_loss = calc_criterion(out, labels_cat)
+                        
+                        # Clean up intermediate tensors
+                        del out, labels_1, labels_2, labels_1_tensor, labels_2_tensor, bg_mask, labels_cat
+                        del logits
+                        
+                        # Keep the first output for further processing
+                        outputs = outputs[0]
                     else:
-                        # If no valid layers, use only the main output
+                        temp_output = F.sigmoid(outputs)
+                        temp_loss = criterion(temp_output, labels)
+                        temp_calc_loss = calc_criterion(temp_output, labels)
+                        
+                        # Clean up intermediate tensors
+                        del temp_output
+                    
+                    # Log memory before backward pass
+                    log_memory_usage(f"Iteration {i} - Before backward pass", {
+                        "temp_loss": temp_loss
+                    }, device=self.device, verbose=self.verbose)
+                    
+                    temp_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
 
-                        temp_logit = F.sigmoid(logits[0])
-                        temp_complement = 1 - temp_logit
-                        temp_logit = torch.cat((temp_complement, temp_logit), 1)
-                        labels_complement = 1 - labels
-                        labels = torch.cat((labels_complement, labels), 1)
-                        print(temp_logit.shape, labels.shape)
-                        temp_loss = self.deep_supervision_losses[0](temp_logit, labels)
-                        del temp_logit
-                        del temp_complement
-                        del labels_complement
-                        del labels
+                    # Log memory after backward pass
+                    log_memory_usage(f"Iteration {i} - After backward pass", device=self.device, verbose=self.verbose)
+                    
+                    # Extract scalar values to avoid tensor references
+                    loss_value = temp_loss.detach().mean().item()
+                    dice_value = temp_calc_loss.mean().item()
+                    
+                    loss_total += loss_value
+                    dice_total += dice_value
+                    num_iter += 1
+                    
+                    if self.enable_deep_supervision:
+                        self.async_log(temp_loss, temp_calc_loss)
+                    else:
+                        # Log scalar values directly
+                        wandb.log({'train loss': loss_value, 'train dice loss': loss_value})
+                    
+                    # Clean up remaining tensors
+                    del temp_loss, temp_calc_loss
+                    del inputs, labels, outputs
+                    del loss_value, dice_value  # Also delete scalar values
+                    
+                    # Clear optimizer state buffers that might be accumulating
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param.grad = None
+                    
+                    # Force clearing the autograd graph
+                    torch.cuda.empty_cache()
+                    
+                    # Force a garbage collection periodically
+                    if i % 50 == 0:
+                        # Log memory before garbage collection
+                        before_gc = log_memory_usage(f"Iteration {i} - Before garbage collection", device=self.device, verbose=self.verbose)
+                        
+                        import gc
+                        # Collect everything, including cyclic references
+                        gc.collect(2)
+                        torch.cuda.empty_cache()
+                        
+                        # Log memory after garbage collection
+                        after_gc = log_memory_usage(f"Iteration {i} - After garbage collection", device=self.device, verbose=self.verbose)
+                        
+                        # Calculate memory freed for the specific device
+                        if isinstance(before_gc, dict) and isinstance(after_gc, dict):
+                            # Multiple GPUs
+                            device_idx = int(self.device) if isinstance(self.device, str) else self.device
+                            device_key = f"GPU {device_idx}"
+                            memory_freed = before_gc.get(device_key, 0) - after_gc.get(device_key, 0)
+                        else:
+                            # Single GPU
+                            memory_freed = before_gc - after_gc
+                            
+                        if self.verbose:
+                            print(f"Memory freed by GC: {memory_freed:.2f} MB", flush=True)
+                    
+                    # Additional cleanup for wandb
+                    if hasattr(wandb, 'run') and wandb.run is not None:
+                        # Force wandb to sync and clear any pending logs
+                        try:
+                            wandb.log({})  # Empty log to force sync
+                        except:
+                            pass
+                    
+                    # Clear any remaining CUDA caches
+                    torch.cuda.empty_cache()
+                    
+                    # Force Python to release memory
+                    if i % 100 == 0:
+                        import gc
+                        # Run multiple collection passes to ensure cyclic references are cleared
+                        for _ in range(3):
+                            gc.collect()
 
-                    # Calculate final output loss for monitoring
-                    out = F.sigmoid(outputs[0])
-                    temp_calc_loss = calc_criterion(out, labels)
-                    outputs = outputs[0]
-                else:
-                    temp_output = F.sigmoid(outputs)
-                    temp_loss = criterion(temp_output, labels)
-                    temp_calc_loss = calc_criterion(temp_output, labels)
+                except torch.cuda.OutOfMemoryError as e:
+                    # Log detailed information about the tensors that might be causing the OOM
+                    print(f"\n\n*** CUDA OUT OF MEMORY ERROR in iteration {i} ***")
+                    print(f"Error details: {str(e)}")
+                    
+                    # Try to log the sizes of key tensors if they exist
+                    try:
+                        tensor_info = {}
+                        if 'inputs' in locals():
+                            tensor_info['inputs'] = inputs
+                        if 'labels' in locals():
+                            tensor_info['labels'] = labels
+                        if 'outputs' in locals():
+                            if isinstance(outputs, (list, tuple)):
+                                for j, out in enumerate(outputs):
+                                    tensor_info[f'outputs[{j}]'] = out
+                            else:
+                                tensor_info['outputs'] = outputs
+                        if 'logits' in locals():
+                            if isinstance(logits, (list, tuple)):
+                                for j, logit in enumerate(logits):
+                                    tensor_info[f'logits[{j}]'] = logit
+                            else:
+                                tensor_info['logits'] = logits
+                                
+                        log_memory_usage("OOM ERROR - Tensor sizes", tensor_info, device=self.device, verbose=self.verbose)
+                    except Exception as inner_e:
+                        print(f"Error while logging tensor info: {inner_e}")
+                    
+                    # Try to free memory
+                    try:
+                        for name in ['inputs', 'labels', 'outputs', 'logits', 'temp_logit', 'temp_output']:
+                            if name in locals():
+                                print(f"Deleting {name}")
+                                del locals()[name]
+                        
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        print("Cleared cache after OOM")
+                    except Exception as inner_e:
+                        print(f"Error while clearing memory: {inner_e}")
+                    
+                    # Save information about the batch that caused the OOM
+                    try:
+                        with open(os.path.join(self.fold_dir, 'oom_info.txt'), 'w') as f:
+                            f.write(f"OOM occurred at epoch {epoch}, iteration {i}\n")
+                            f.write(f"Error details: {str(e)}\n")
+                            
+                            # Get memory for all GPUs
+                            memory_stats = {}
+                            for gpu_idx in range(torch.cuda.device_count()):
+                                try:
+                                    memory_stats[f"GPU {gpu_idx}"] = torch.cuda.memory_allocated(gpu_idx) / 1024 / 1024
+                                except:
+                                    memory_stats[f"GPU {gpu_idx}"] = "Error getting memory"
+                            
+                            f.write(f"GPU memory at crash: {memory_stats}\n")
+                            f.write(f"Training device: {self.device}\n\n")
+                            
+                            # Save file information
+                            f.write("File Information:\n")
+                            if 'file_info' in locals() and file_info:
+                                for key, value in file_info.items():
+                                    f.write(f"{key}: {value}\n")
+                            else:
+                                f.write("No file information available\n")
+                            
+                            # Save detailed tensor shapes
+                            f.write("\nTensor Shapes:\n")
+                            if 'inputs' in locals():
+                                f.write(f"inputs: {inputs.shape}, dtype={inputs.dtype}, device={inputs.device}\n")
+                                if hasattr(inputs, 'min') and hasattr(inputs, 'max'):
+                                    f.write(f"inputs value range: min={inputs.min().item()}, max={inputs.max().item()}\n")
+                            
+                            if 'labels' in locals():
+                                f.write(f"labels: {labels.shape}, dtype={labels.dtype}, device={labels.device}\n")
+                                if hasattr(labels, 'min') and hasattr(labels, 'max'):
+                                    f.write(f"labels value range: min={labels.min().item()}, max={labels.max().item()}\n")
+                                    f.write(f"labels unique values: {torch.unique(labels).tolist()}\n")
+                            
+                            if 'outputs' in locals():
+                                if isinstance(outputs, (list, tuple)):
+                                    for j, out in enumerate(outputs):
+                                        f.write(f"outputs[{j}]: {out.shape}, dtype={out.dtype}, device={out.device}\n")
+                                else:
+                                    f.write(f"outputs: {outputs.shape}, dtype={outputs.dtype}, device={outputs.device}\n")
+                            
+                            if 'logits' in locals():
+                                if isinstance(logits, (list, tuple)):
+                                    for j, logit in enumerate(logits):
+                                        f.write(f"logits[{j}]: {logit.shape}, dtype={logit.dtype}, device={logit.device}\n")
+                                else:
+                                    f.write(f"logits: {logits.shape}, dtype={logits.dtype}, device={logits.device}\n")
+                    except Exception as inner_e:
+                        print(f"Error while saving OOM info: {inner_e}")
+                    
+                    # Re-raise the error
+                    raise
                 
-                temp_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+                except Exception as e:
+                    print(f"Error in iteration {i}: {e}")
+                    raise
 
-                
-                loss_total += temp_loss.detach().mean()
-                dice_total += temp_calc_loss.mean()
-                num_iter += 1
-                if self.enable_deep_supervision:
-                    self.async_log(temp_loss, temp_calc_loss)
-                else:
-                    wandb.log({'train loss': temp_loss.mean().item(), 'train dice loss': temp_loss.mean().item()})
-                del temp_logit
-                del temp_calc_loss
-                
+            if self.verbose:
+                print(f"Train {epoch} took {time.time() - t1} seconds", flush=True)
 
-            print(f"Train {epoch} took {time.time() - t1} seconds", flush=True)
-
-            loss_total = loss_total.item()
-            dice_total = dice_total.item()
+            loss_total = loss_total
+            dice_total = dice_total
                     
             print(f'Epoch: {epoch}, Loss: {loss_total/(num_iter)}, Dice Loss: {dice_total/(num_iter)}', flush=True)
+            
+            # Save information about the largest tensors seen in this epoch
+            if hasattr(self, 'largest_input_shape'):
+                with open(os.path.join(self.fold_dir, f'largest_tensors_epoch_{epoch}.txt'), 'w') as f:
+                    f.write(f"Epoch {epoch} largest tensor information:\n")
+                    f.write(f"Largest input shape: {self.largest_input_shape}\n")
+                    f.write(f"Total elements: {np.prod(self.largest_input_shape)}\n")
+                    f.write(f"Estimated memory (float32): {np.prod(self.largest_input_shape) * 4 / (1024*1024):.2f} MB\n")
+                    if self.largest_input_file:
+                        f.write(f"From file: {self.largest_input_file}\n")
+                    if self.verbose:
+                        print(f"Saved largest tensor information for epoch {epoch}", flush=True)
+                
+                # Reset for next epoch
+                del self.largest_input_shape
+                del self.largest_input_file
+            
+            # Perform aggressive memory cleanup at the end of each epoch
+            if self.verbose:
+                print(f"Performing aggressive memory cleanup at end of epoch {epoch}", flush=True)
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad = None
+            
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            
+            # Full garbage collection
+            import gc
+            gc.collect(2)
+            
+            # Log memory after cleanup
+            log_memory_usage(f"End of epoch {epoch} - After cleanup", device=self.device, verbose=self.verbose)
+            
             self.train_loader.restart()
             self.train_loader.generator.shuffle_indices()
             self.model.eval()
@@ -556,15 +955,12 @@ class SWINUNETRTrainer(object):
 
                     learned_loss = val_criterion(outputs[:, :, ...], labels[:, :, ...])
 
-                    loss_total += learned_loss.mean()
-                    loss_dice += temp_loss_calc.mean()
+                    loss_total += learned_loss.item()
+                    loss_dice += temp_loss_calc.item()
                     num_iter += 1
 
 
                     self.async_log(learned_loss, temp_loss_calc, split='val')
-
-                loss_total = loss_total.item()
-                loss_dice = loss_dice.item()
 
                 self.test_loader.restart()
                 self.test_loader.generator.shuffle_indices()
@@ -733,10 +1129,14 @@ def run_training_entry():
                         help="Device to train the model on.")    
     parser.add_argument('-LR',type=bool, required=False, default=False)
     parser.add_argument('-roi', type=bool, required=False, default=True)
+    parser.add_argument('--quiet', action='store_true', required=False,
+                        help="Reduce verbosity of logging output")
     args = parser.parse_args()
 
 
-    trainer = SWINUNETRTrainer(weights=args.pretrained_weights, fold=args.fold, dataset_dir=args.dataset_dir, device=args.device, continue_tr=args.c, LR=args.LR, roi=args.roi)
+    trainer = SWINUNETRTrainer(weights=args.pretrained_weights, fold=args.fold, dataset_dir=args.dataset_dir, 
+                              device=args.device, continue_tr=args.c, LR=args.LR, roi=args.roi, 
+                              verbose=not args.quiet)
     trainer.run_training()
 
 if __name__ == '__main__':
