@@ -57,11 +57,11 @@ def get_augmentations():
         spatial_transform,
         gaussian_noise,
         gaussian_blur,
-        brightness_multiplicative,
-        contrast_augmentation,
-        low_resolution_simulation,
-        gamma_transform_retain_stats,
-        gamma_transform
+        # brightness_multiplicative,
+        # contrast_augmentation,
+        # low_resolution_simulation,
+        # gamma_transform_retain_stats,
+        # gamma_transform
     ]
     
     transforms = Compose(all_transforms)

@@ -82,14 +82,15 @@ class CustomDataLoader(DataLoader):
                 seg = seg.numpy().astype(np.float32)
                 roi = roi.numpy().astype(np.float32)
         
-        return data, seg, roi
+        # Check if there are any labeled voxels at all
+        has_labels = np.sum(seg > 0) > 0
+        
+        return data, seg, roi, has_labels
 
     @staticmethod
     def normalize(data):
         return (data - np.mean(data)) / (np.std(data) + np.finfo(np.float32).eps)
     
-    import numpy as np
-
     @staticmethod
     def amount_padding(data):
         '''
@@ -160,29 +161,52 @@ class CustomDataLoader(DataLoader):
         idx = self.get_indices()
         data_names = [self.data_names[i] for i in idx]
         if self.val:
-            temp_data, temp_seg, temp_roi = self.load_data(data_names[0], data_names[0].replace('_0000', '').replace('images', 'labels').replace('_image', ''))
-            temp_seg[temp_seg == 2] = 1
+            temp_data, temp_seg, temp_roi, _ = self.load_data(data_names[0], data_names[0].replace('_0000', '').replace('images', 'labels').replace('_image', ''))
+            temp_seg[temp_seg == 2] = 2
             temp_seg[temp_seg == 3] = 0
             temp_seg[temp_seg == 4] = 0
 
             temp_data = np.expand_dims(temp_data, axis=(0, 1))
             temp_seg = np.expand_dims(temp_seg, axis=(0, 1))
             temp_roi = np.expand_dims(temp_roi, axis=(0, 1))
-            return {'data': temp_data, 'seg': temp_seg, 'roi_name': data_names[0].replace('_0000', '').replace('images', 'roi'), 'data_name': data_names[0], 'seg_name': data_names[0].replace('_0000', '').replace('images', 'labels'), 'roi': temp_roi}
+            return {'data': temp_data, 'seg': temp_seg, 'roi': temp_roi, 'roi_name': data_names[0].replace('_0000', '').replace('images', 'roi'), 'data_name': data_names[0], 'seg_name': data_names[0].replace('_0000', '').replace('images', 'labels')}
+        
         inputs = []
         masks = []
         rois = []
+        
+        # Track number of cases with foreground
+        cases_with_foreground = 0
+        total_cases = 0
 
         for data_name in data_names:
-            temp_data, temp_seg, temp_roi = self.load_data(data_name, data_name.replace('_0000', '').replace('images', 'labels').replace('_image', ''))
-            temp_seg[temp_seg == 2] = 1
+            temp_data, temp_seg, temp_roi, has_labels = self.load_data(data_name, data_name.replace('_0000', '').replace('images', 'labels').replace('_image', ''))
+            total_cases += 1
+
+            # --- Add Check for Valid Loaded Segmentation ---
+            if temp_seg is None or temp_seg.size == 0 or len(temp_seg.shape) < 3:
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                print(f"WARNING: Skipping invalid/empty segmentation mask loaded for: {data_name}")
+                print(f"Shape: {getattr(temp_seg, 'shape', type(temp_seg))}")
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                # Skip this sample - do not add it to the batch lists
+                continue
+            # --- End Check ---
+
+            if has_labels:
+                cases_with_foreground += 1
+                
+            temp_seg[temp_seg == 2] = 2
             temp_seg[temp_seg == 3] = 0
             temp_seg[temp_seg == 4] = 0
 
             temp_data = np.expand_dims(temp_data, axis=(0, 1))
             temp_seg = np.expand_dims(temp_seg, axis=(0, 1))
             temp_roi = np.expand_dims(temp_roi, axis=(0, 1))
+            
+            # Apply downsampling if needed
             temp_data, temp_seg, temp_roi = self.down_size(temp_data, temp_seg, temp_roi)
+            
             inputs.append(temp_data)
             masks.append(temp_seg)
             rois.append(temp_roi)
@@ -199,8 +223,17 @@ class CustomDataLoader(DataLoader):
         complement_masks = self.generate_complement_mask(masks)
         
         combined_data = np.concatenate((inputs, rois), axis=1).astype(np.float32)
-        combined_seg = np.concatenate((complement_masks, masks), axis=1).astype(np.float32)
         roi_name = data_name.replace('_0000', '').replace('images', 'roi')
-        roi = rois
 
-        return {'data': combined_data, 'seg': combined_seg, 'roi_name': roi_name, 'data_name': data_name, 'seg_name': data_name.replace('_0000', '').replace('images', 'labels'), 'roi': roi}
+        # Calculate foreground ratio for monitoring
+        foreground_ratio = cases_with_foreground / max(1, total_cases)
+
+        return {
+            'data': combined_data,
+            'seg': masks,
+            'roi': rois,
+            'roi_name': roi_name,
+            'data_name': data_name,
+            'seg_name': data_name.replace('_0000', '').replace('images', 'labels'),
+            'foreground_ratio': foreground_ratio
+        }

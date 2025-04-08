@@ -1,9 +1,10 @@
 import os
 from SwinUNeTRGen import SwinUNETRMaskGen
 import numpy as np
+import ntpath # Use ntpath for OS-agnostic path manipulation
 
-def predict(model, LR=False, use_roi=True, fold=0):
-    maskGen = SwinUNETRMaskGen(f"/home/user/Nathan/Desktop/SWINUNETR_ARTF/{model}/fold_{fold}/checkpoint_best.pt", device='cuda:1', full_size=True)
+def predict(model_path, device, LR=False, use_roi=False): # Changed model->model_path, added device, removed use_roi default
+    maskGen = SwinUNETRMaskGen(model_path, device=device, full_size=True) # Use model_path and device args
     true_artf = os.listdir("/raid/trueArtifacts")
 
     true_arts = [img for img in true_artf if "image" in img]
@@ -22,6 +23,13 @@ def predict(model, LR=False, use_roi=True, fold=0):
 
             true_rois = temp
 
+    # Determine a meaningful suffix for the output directory from the model path
+    model_dir_name = ntpath.basename(ntpath.dirname(model_path)) # Get the parent directory name (e.g., fold_0)
+    output_suffix = model_dir_name if model_dir_name else "output" # Use parent dir name or default
+
+    output_dir = f"/raid/trueArtifacts_{output_suffix}" # Create output dir name
+    os.makedirs(output_dir, exist_ok=True) # Create the directory
+
     for i in range(len(true_arts)):
         img = np.load("/raid/trueArtifacts/" + true_arts[i])
         if use_roi:
@@ -32,22 +40,23 @@ def predict(model, LR=False, use_roi=True, fold=0):
             else:
                 roi = np.load("/raid/trueArtifacts/" + true_rois[i])
         else:
+            # If not using ROI, create a full mask, but this branch might be less relevant now ROI is required
             roi = np.ones_like(img)
-        
-        mask1 = maskGen(img, roi, roi)
-        model = model.split("_")[-1]
-        os.makedirs(f"/raid/trueArtifacts{model}{fold}", exist_ok=True)
-        np.savez_compressed(f"/raid/trueArtifacts{model}{fold}/" + true_arts[i].replace("image", "predMask").replace(".npy", ""), mask1)
+
+        mask1 = maskGen(img, roi, roi) # roi is passed twice based on original code
+        # Remove the old model name splitting logic for output path
+        np.savez_compressed(f"{output_dir}/" + true_arts[i].replace("image", "predMask").replace(".npy", ""), mask1) # Use the new output_dir
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--LR", action="store_true")
-    parser.add_argument("--roi", action="store_true")
-    parser.add_argument("-fold", type=str, required=False)
+    parser = argparse.ArgumentParser(description="Run SwinUNETR prediction on artifact images.")
+    parser.add_argument("--model_path", type=str, required=True, help="Full path to the model checkpoint file (.pt)") # Changed --model to --model_path
+    parser.add_argument("--device", type=str, required=True, help="CUDA device to use (e.g., cuda:0, cuda:1)") # Added --device argument
+    parser.add_argument("--LR", action="store_true", help="Use Left/Right specific ROI naming convention.")
+    parser.add_argument("--roi", action="store_true", required=True, help="Use ROI masks for prediction (required).") # Made --roi required
+    # Removed -fold argument as it's implicitly handled by model_path parent dir
     args = parser.parse_args()
-    predict(args.model, args.LR, args.roi, args.fold)
+    predict(args.model_path, args.device, args.LR, args.roi) # Updated function call
 
     
 
