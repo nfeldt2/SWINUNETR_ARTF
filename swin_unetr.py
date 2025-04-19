@@ -254,70 +254,25 @@ class SwinUNETR(nn.Module):
             res_block=True,
         )
 
-        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels+1)
+        # Main output block (highest resolution)
+        self.final_out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=1)
+
+        # --- Deep Supervision Heads (if enabled) ---
         if self.deep_supervision:
-            self.out1 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels+1)
-            self.out2 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size*2, out_channels=out_channels)
-            self.out3 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size*4, out_channels=out_channels)
-            self.out4 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size*8, out_channels=out_channels)
+            self.ds_1 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=1) # From decoder1 output (feeds into final_out)
+            self.ds_2 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 2, out_channels=1) # From decoder2 output
+            self.ds_3 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 4, out_channels=1) # From decoder3 output
+            self.ds_4 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 8, out_channels=1) # From decoder4 output
 
-    def load_from(self, weights):
-        with torch.no_grad():
-            self.swinViT.patch_embed.proj.weight.copy_(weights["state_dict"]["module.patch_embed.proj.weight"])
-            self.swinViT.patch_embed.proj.bias.copy_(weights["state_dict"]["module.patch_embed.proj.bias"])
-            for bname, block in self.swinViT.layers1[0].blocks.named_children():
-                block.load_from(weights, n_block=bname, layer="layers1")
-            self.swinViT.layers1[0].downsample.reduction.weight.copy_(
-                weights["state_dict"]["module.layers1.0.downsample.reduction.weight"]
-            )
-            self.swinViT.layers1[0].downsample.norm.weight.copy_(
-                weights["state_dict"]["module.layers1.0.downsample.norm.weight"]
-            )
-            self.swinViT.layers1[0].downsample.norm.bias.copy_(
-                weights["state_dict"]["module.layers1.0.downsample.norm.bias"]
-            )
-            for bname, block in self.swinViT.layers2[0].blocks.named_children():
-                block.load_from(weights, n_block=bname, layer="layers2")
-            self.swinViT.layers2[0].downsample.reduction.weight.copy_(
-                weights["state_dict"]["module.layers2.0.downsample.reduction.weight"]
-            )
-            self.swinViT.layers2[0].downsample.norm.weight.copy_(
-                weights["state_dict"]["module.layers2.0.downsample.norm.weight"]
-            )
-            self.swinViT.layers2[0].downsample.norm.bias.copy_(
-                weights["state_dict"]["module.layers2.0.downsample.norm.bias"]
-            )
-            for bname, block in self.swinViT.layers3[0].blocks.named_children():
-                block.load_from(weights, n_block=bname, layer="layers3")
-            self.swinViT.layers3[0].downsample.reduction.weight.copy_(
-                weights["state_dict"]["module.layers3.0.downsample.reduction.weight"]
-            )
-            self.swinViT.layers3[0].downsample.norm.weight.copy_(
-                weights["state_dict"]["module.layers3.0.downsample.norm.weight"]
-            )
-            self.swinViT.layers3[0].downsample.norm.bias.copy_(
-                weights["state_dict"]["module.layers3.0.downsample.norm.bias"]
-            )
-            for bname, block in self.swinViT.layers4[0].blocks.named_children():
-                block.load_from(weights, n_block=bname, layer="layers4")
-            self.swinViT.layers4[0].downsample.reduction.weight.copy_(
-                weights["state_dict"]["module.layers4.0.downsample.reduction.weight"]
-            )
-            self.swinViT.layers4[0].downsample.norm.weight.copy_(
-                weights["state_dict"]["module.layers4.0.downsample.norm.weight"]
-            )
-            self.swinViT.layers4[0].downsample.norm.bias.copy_(
-                weights["state_dict"]["module.layers4.0.downsample.norm.bias"]
-            )
+        self.apply(self._init_weights)
 
-    @torch.jit.unused
-    def _check_input_size(self, spatial_shape):
-        img_size = np.array(spatial_shape)
+    def _check_input_size(self, img_size: tuple[int, ...]) -> None:
+        img_size = np.array(img_size)
         remainder = (img_size % np.power(self.patch_size, 5)) > 0
         if remainder.any():
             wrong_dims = (np.where(remainder)[0] + 2).tolist()
             raise ValueError(
-                f"spatial dimensions {wrong_dims} of input image (spatial shape: {spatial_shape})"
+                f"spatial dimensions {wrong_dims} of input image (spatial shape: {img_size})"
                 f" must be divisible by {self.patch_size}**5."
             )
 
@@ -335,15 +290,32 @@ class SwinUNETR(nn.Module):
         dec1 = self.decoder3(dec2, enc2)
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
+        
+        # Apply skip connections from initial encoders
+        out = self.final_out(out) 
+
+        # --- Deep Supervision Outputs ---
         if self.deep_supervision:
-            out = self.out(out)
-            out1 = self.out1(dec0)
-            out2 = self.out2(dec1)
-            out3 = self.out3(dec2)
-            out4 = self.out4(dec3)
-            return out, out1, out2, out3, out4
-        logits = self.out(out)
-        return logits
+            # Generate outputs from intermediate decoder stages before final block
+            ds1_logits = self.ds_1(dec0) # Output from stage fed into decoder1
+            ds2_logits = self.ds_2(dec1) # Output from stage fed into decoder2
+            ds3_logits = self.ds_3(dec2) # Output from stage fed into decoder3
+            ds4_logits = self.ds_4(dec3) # Output from stage fed into decoder4 (decoder5 output)
+            
+            # Return in order: [main_logits, ds1, ds2, ds3, ds4]
+            # Order should align with deep_supervision_weights in train.py (typically high-res first)
+            return [out, ds1_logits, ds2_logits, ds3_logits, ds4_logits]
+        else:
+            return out
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
 
 def window_partition(x, window_size):
@@ -665,40 +637,6 @@ class SwinTransformerBlock(nn.Module):
 
     def forward_part2(self, x):
         return self.drop_path(self.mlp(self.norm2(x)))
-
-    def load_from(self, weights, n_block, layer):
-        root = f"module.{layer}.0.blocks.{n_block}."
-        block_names = [
-            "norm1.weight",
-            "norm1.bias",
-            "attn.relative_position_bias_table",
-            "attn.relative_position_index",
-            "attn.qkv.weight",
-            "attn.qkv.bias",
-            "attn.proj.weight",
-            "attn.proj.bias",
-            "norm2.weight",
-            "norm2.bias",
-            "mlp.fc1.weight",
-            "mlp.fc1.bias",
-            "mlp.fc2.weight",
-            "mlp.fc2.bias",
-        ]
-        with torch.no_grad():
-            self.norm1.weight.copy_(weights["state_dict"][root + block_names[0]])
-            self.norm1.bias.copy_(weights["state_dict"][root + block_names[1]])
-            self.attn.relative_position_bias_table.copy_(weights["state_dict"][root + block_names[2]])
-            self.attn.relative_position_index.copy_(weights["state_dict"][root + block_names[3]])
-            self.attn.qkv.weight.copy_(weights["state_dict"][root + block_names[4]])
-            self.attn.qkv.bias.copy_(weights["state_dict"][root + block_names[5]])
-            self.attn.proj.weight.copy_(weights["state_dict"][root + block_names[6]])
-            self.attn.proj.bias.copy_(weights["state_dict"][root + block_names[7]])
-            self.norm2.weight.copy_(weights["state_dict"][root + block_names[8]])
-            self.norm2.bias.copy_(weights["state_dict"][root + block_names[9]])
-            self.mlp.linear1.weight.copy_(weights["state_dict"][root + block_names[10]])
-            self.mlp.linear1.bias.copy_(weights["state_dict"][root + block_names[11]])
-            self.mlp.linear2.weight.copy_(weights["state_dict"][root + block_names[12]])
-            self.mlp.linear2.bias.copy_(weights["state_dict"][root + block_names[13]])
 
     def forward(self, x, mask_matrix):
         shortcut = x
