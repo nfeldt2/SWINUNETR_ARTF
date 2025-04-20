@@ -7,6 +7,7 @@ import warnings
 import pickle
 import random
 import math
+import concurrent.futures # Import concurrent.futures
 
 import numpy as np
 import torch
@@ -23,12 +24,12 @@ from monai.transforms.transform import MapTransform
 from monai.transforms import (
     Compose, EnsureChannelFirstd, Orientationd, Spacingd,
     Resized, RandRotate90d, RandGaussianNoised, EnsureTyped,
-    ScaleIntensityRanged,
+    ScaleIntensityRanged, RandCropByPosNegLabeld
 )
 from monai.networks.nets import DenseNet121
 from monai.utils import set_determinism
 # import monai focal loss
-from monai.losses import FocalLoss
+# from monai.losses import FocalLoss # <-- Comment out FocalLoss import
 
 from Augmentations import get_augmentations
 
@@ -119,6 +120,43 @@ class LoadPairedArr0d(MapTransform):
         return d
 # --- End Custom Transform ---
 
+# --- Custom Transform to get Label from Segmentation ---
+class GetLabelFromSegd(MapTransform):
+    """
+    Calculates the image-level label from the segmentation mask after initial transforms.
+    Stores the label under the specified `label_key`.
+    Removes the original segmentation mask key.
+    """
+    def __init__(self, keys: str, label_key: str = 'label', min_pixels_threshold: int = 100, allow_missing_keys: bool = False):
+        super().__init__(keys, allow_missing_keys)
+        self.label_key = label_key
+        self.min_pixels_threshold = min_pixels_threshold
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            seg_tensor = d[key]
+            # Ensure it's numpy for get_image_label
+            seg_np = seg_tensor.cpu().numpy() if isinstance(seg_tensor, torch.Tensor) else np.asarray(seg_tensor)
+
+            image_label = 0 # Default to 0
+            if seg_np.ndim > 0 and seg_np.shape[0] > 0:
+                 if seg_np.shape[0] == 1:
+                     seg_for_label = seg_np[0]
+                 else: # More than 1 channel? Use first.
+                     seg_for_label = seg_np[0]
+                 image_label = get_image_label(seg_for_label, self.min_pixels_threshold)
+            else:
+                 # Handle unexpected shape, label remains 0
+                 # Consider logging this event
+                 pass
+            
+            d[self.label_key] = image_label
+            # Remove the segmentation key after processing?
+            # Let's keep seg for now, might be useful for debugging test loop
+            # if not self.allow_missing_keys and key in d:
+            #      del d[key]
+        return d
 
 # --- New DataLoader based on Dataloaders.py structure ---
 class ArtifactClassificationDataLoader(DataLoader):
@@ -135,103 +173,146 @@ class ArtifactClassificationDataLoader(DataLoader):
             batch_size: The batch size for generating batches.
             monai_transforms: MONAI Compose object for initial loading and preprocessing.
                               Should output 'image' and 'seg' keys (Tensors or NumPy).
-            min_pixels_threshold: Minimum artifact pixels to assign label 1 or 2.
-            num_threads_in_multithreaded: Passed to DataLoader for internal use.
+            min_pixels_threshold: Minimum artifact pixels required *after* transforms to assign label 1 or 2.
+            num_threads_in_multithreaded: Passed to DataLoader for internal use (used by batchgenerators).
+            # num_item_threads: Number of threads to use for loading items within a batch. Defaults to half CPU cores.
         """
-        super().__init__(data_dicts, batch_size, num_threads_in_multithreaded)
+        # Pass num_threads_in_multithreaded=1 to parent, as we handle parallelism differently
+        # super().__init__(data_dicts, batch_size, 1)
+        super().__init__(data_dicts, batch_size, num_threads_in_multithreaded) # Revert to original parent call
         self.monai_transforms = monai_transforms
         self.min_pixels_threshold = min_pixels_threshold
         self.indices = list(range(len(data_dicts)))
+        # if num_item_threads is None:
+        #      num_item_threads = max(1, os.cpu_count() // 2)
+        # self.num_item_threads = num_item_threads
+        # No need to store cli_args globally here
 
     def __len__(self):
         return len(self._data)
 
     # get_indices is inherited from DataLoader
 
+    # Remove the parallel loading helper function
+    # def _load_and_transform_item(self, index):
+    #     ...
+
     def generate_train_batch(self):
         """
         Generates a batch of data suitable for training.
-        Loads data, applies MONAI transforms, derives labels, returns NumPy arrays.
+        Loads data sequentially, applies MONAI transforms (including crop),
+        checks cropped seg for min pixels, derives labels (1 or 2), returns NumPy arrays.
         """
-        indices = self.get_indices()
+        indices = self.get_indices() # Get indices for the current batch
 
         batch_images = []
-        batch_segs = [] # Keep segs for potential spatial transforms in batchgenerators
-        batch_labels = []
+        batch_segs = []
+        batch_labels = [] # Store original labels (1 or 2)
         batch_filenames = []
+        skipped_count = 0
 
+        # Sequential processing loop
         for idx in indices:
             data_dict_i = self._data[idx]
-
+            filename = Path(data_dict_i.get('image_path', 'unknown')).name
             try:
-                filename = Path(data_dict_i['image_path']).name
+                # Apply all MONAI transforms, including the crop
                 transformed_data = self.monai_transforms(data_dict_i)
 
                 if "image" not in transformed_data or "seg" not in transformed_data:
-                    raise KeyError(f"MONAI transforms did not produce 'image' and 'seg' keys for {filename}. Keys found: {transformed_data.keys()}")
+                     tqdm.write(f"Warning: MONAI transforms did not produce 'image' and 'seg' keys for {filename}. Skipping.")
+                     skipped_count += 1
+                     continue
 
-                image_tensor = transformed_data['image']
+                # Ensure seg is numpy for checking
                 seg_tensor = transformed_data['seg']
+                seg_np = seg_tensor.cpu().numpy() if isinstance(seg_tensor, torch.Tensor) else np.asarray(seg_tensor)
+                image_tensor = transformed_data['image']
+                image_np = image_tensor.cpu().numpy() if isinstance(image_tensor, torch.Tensor) else np.asarray(image_tensor)
 
-                image_np = image_tensor.cpu().numpy()
-                seg_np = seg_tensor.cpu().numpy()
+                # Check if the *cropped* seg has enough artifact pixels
+                # Using min_artifact_pixels argument (e.g., 10)
+                artifact_pixels = np.count_nonzero(seg_np == 1) + np.count_nonzero(seg_np == 2)
+                if artifact_pixels < self.min_pixels_threshold:
+                    # tqdm.write(f"Debug: Cropped {filename} had only {artifact_pixels} artifact pixels (threshold {self.min_pixels_threshold}). Skipping.")
+                    skipped_count += 1
+                    continue # Skip this sample
 
+                # Derive label (1 or 2) from the valid cropped seg
                 if seg_np.shape[0] == 1:
                     seg_for_label = seg_np[0]
-                else:
-                    tqdm.write(f"Warning: Seg mask for {filename} has shape {seg_np.shape}. Using first channel for label.")
+                elif seg_np.ndim > 0 and seg_np.shape[0] > 1:
                     seg_for_label = seg_np[0]
+                else:
+                    # Should not happen if artifact_pixels check passed, but as fallback:
+                    tqdm.write(f"Warning: Unexpected seg shape {seg_np.shape} for {filename} after passing pixel check. Skipping.")
+                    skipped_count += 1
+                    continue
+                
+                # Use get_image_label, thresholding >= 1 pixel since we already checked the minimum count
+                image_label = get_image_label(seg_for_label, min_pixels_threshold=1) 
+                
+                if image_label == 0: # Should ideally not happen if artifact_pixels check is correct
+                     tqdm.write(f"Warning: Label derived as 0 for {filename} after passing pixel count check ({artifact_pixels} pixels). Skipping.")
+                     skipped_count += 1
+                     continue
 
-                image_label = get_image_label(seg_for_label, self.min_pixels_threshold)
-
+                # Add the valid sample to the batch lists
                 batch_images.append(image_np)
                 batch_segs.append(seg_np)
-                batch_labels.append(image_label)
+                batch_labels.append(image_label) # Store 1 or 2
                 batch_filenames.append(filename)
 
             except FileNotFoundError as e:
                  tqdm.write(f"File not found error processing sample index {idx} ({data_dict_i.get('image_path', 'N/A')}): {e}. Skipping.")
+                 skipped_count += 1
                  continue
             except Exception as e:
                 tqdm.write(f"Error processing sample index {idx} ({data_dict_i.get('image_path', 'N/A')}): {e}")
-                import traceback
-                traceback.print_exc() # Keep traceback for now, might still interfere
+                skipped_count += 1
+                # import traceback
+                # traceback.print_exc()
                 continue # Skip this sample
 
+        if skipped_count > 0 and len(indices) > 0:
+            tqdm.write(f"Skipped {skipped_count}/{len(indices)} samples in batch due to missing keys, errors, or insufficient pixels post-crop.")
+
         if not batch_images:
-            tqdm.write("Warning: generate_train_batch generated an empty batch.")
-            # Determine expected shape (e.g., from args.input_size) - need to know channel count (1?)
-            c, d, h, w = 1, args.input_size[0], args.input_size[1], args.input_size[2]
+            # If all samples were skipped, return an empty batch structure
+            tqdm.write("Warning: generate_train_batch generated an empty batch after processing/filtering.")
+            c, d, h, w = 1, 64, 160, 256 # Placeholder shape, adjust if needed
             return {
                 'data': np.empty((0, c, d, h, w), dtype=np.float32),
                 'seg': np.empty((0, c, d, h, w), dtype=np.float32),
                 'label': np.empty((0,), dtype=np.int64),
-                'filenames': []
+                'filenames': [],
+                'roi': np.empty((0, c, d, h, w), dtype=np.int64)
              }
 
+        # Stack the collected valid samples
         try:
             image_batch_np = np.stack(batch_images, axis=0)
             seg_batch_np = np.stack(batch_segs, axis=0)
-            label_batch_np = np.array(batch_labels, dtype=np.int64)
+            label_batch_np = np.array(batch_labels, dtype=np.int64) # Labels are 1 or 2 here
         except Exception as stack_e:
             tqdm.write(f"Error stacking batch data: {stack_e}")
             tqdm.write(f"Individual image shapes: {[img.shape for img in batch_images]}")
             tqdm.write(f"Individual seg shapes: {[seg.shape for seg in batch_segs]}")
             # Return empty batch on stacking error
-            c, d, h, w = 1, args.input_size[0], args.input_size[1], args.input_size[2]
+            c, d, h, w = 1, 64, 160, 256 # Placeholder shape
             return {
                 'data': np.empty((0, c, d, h, w), dtype=np.float32),
                 'seg': np.empty((0, c, d, h, w), dtype=np.float32),
                 'label': np.empty((0,), dtype=np.int64),
-                'filenames': []
+                'filenames': [],
+                'roi': np.empty((0, c, d, h, w), dtype=np.int64)
              }
 
         return {
             'data': image_batch_np,
-            'seg': seg_batch_np, # Include seg for spatial transforms
-            'label': label_batch_np,
-            # Use ones_like for ROI placeholder, indicating entire image is ROI
-            'roi': np.ones_like(seg_batch_np, dtype=seg_batch_np.dtype),
+            'seg': seg_batch_np,
+            'label': label_batch_np, # Labels are 1 or 2
+            'roi': np.ones_like(seg_batch_np, dtype=np.int64),
             'filenames': batch_filenames
         }
 
@@ -263,6 +344,26 @@ class ArtifactDataset(monai.data.Dataset): # Inherit from monai.data.Dataset
         image_tensor = transformed_data["image"]
         return {"image": image_tensor, "label": image_label, "filename": filename}
 
+
+# --- Custom Debug Logging Transform ---
+class LogKeysd(MapTransform):
+    """Logs the keys present in the dictionary at this point."""
+    def __init__(self, keys, log_prefix="", allow_missing_keys=True):
+        super().__init__(keys, allow_missing_keys)
+        # `keys` argument is required by MapTransform but we ignore it
+        self.log_prefix = log_prefix
+
+    def __call__(self, data):
+        # We don't modify the data, just log its keys
+        # Add filename to log if available for better tracking
+        filename = data.get('filename', data.get('image_path', ''))
+        if isinstance(filename, Path):
+             filename = filename.name
+        elif isinstance(filename, str):
+             filename = Path(filename).name
+        print(f"DEBUG Keys {self.log_prefix} ({filename}): {list(data.keys())}")
+        return data
+# --- End Custom Debug Logging Transform ---
 
 def main(args):
     set_determinism(seed=args.seed)
@@ -306,30 +407,109 @@ def main(args):
             f"Expected 'train', 'validate', and 'test' subdirectories in {args.dataset_dir}"
         )
 
-    # --- Find and Pair Files ---
-    def find_and_pair_files(data_dir, file_pattern):
+    # --- Find and Pair Files (Multithreaded) --- 
+    def check_and_pair_file(img_path_str, data_dir, pre_filter_non_artifact):
+        """Helper function to check one image file path for pairing and filtering."""
+        img_path = Path(img_path_str)
+        label_filename = img_path.name.replace('_image_', '_maskArtifact_', 1)
+        label_path = img_path.with_name(label_filename)
+
+        if label_path.is_file():
+            if pre_filter_non_artifact:
+                try:
+                    seg_npz = np.load(label_path)
+                    if 'arr_0' not in seg_npz:
+                        # Log warning or handle appropriately - maybe return special value?
+                        # For now, treat as if it might contain artifacts if key is missing
+                        seg_data = None 
+                    else:
+                        seg_data = seg_npz['arr_0']
+                        seg_npz.close()
+
+                    if seg_data is not None and (np.any(seg_data == 1) or np.any(seg_data == 2)):
+                        return {"image_path": img_path_str, "seg_path": str(label_path), "status": "paired"}
+                    elif seg_data is not None: # Contained only background or was empty
+                        return {"status": "filtered"}
+                    else: # seg_data was None (arr_0 key missing)
+                        # Include for now if key was missing
+                        # Log this specific case when processing results
+                        return {"image_path": img_path_str, "seg_path": str(label_path), "status": "paired_key_missing"}
+                except Exception as e:
+                    # Log warning or handle error - maybe return special value?
+                    # Include file but mark that loading failed
+                    return {"image_path": img_path_str, "seg_path": str(label_path), "status": "paired_load_error", "error": str(e)}
+            else: # No pre-filtering
+                return {"image_path": img_path_str, "seg_path": str(label_path), "status": "paired"}
+        else: # Label file not found
+            return {"status": "missing_label", "image_name": img_path.name}
+
+    def find_and_pair_files(data_dir, file_pattern, pre_filter_non_artifact=True, num_threads=None):
+        if num_threads is None:
+             num_threads = os.cpu_count() # Default to number of CPU cores
+        
         paired_files = []
         missing_labels = 0
+        filtered_out = 0
+        load_errors = 0
+        included_key_missing = 0
+
         print(f"Searching for image files ('{file_pattern}' containing '_image_') in {data_dir}...")
         potential_image_files = sorted([str(f) for f in data_dir.glob(file_pattern) if '_image_' in f.name])
-        print(f"Found {len(potential_image_files)} potential image files. Pairing with labels...")
+        print(f"Found {len(potential_image_files)} potential image files. Pairing and filtering using up to {num_threads} threads...")
+        
+        results = []
+        # Use ThreadPoolExecutor for parallel I/O
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Create futures for each file check
+            future_to_path = {executor.submit(check_and_pair_file, img_path, data_dir, pre_filter_non_artifact): img_path for img_path in potential_image_files}
+            
+            # Process results as they complete, using tqdm for progress
+            for future in tqdm(concurrent.futures.as_completed(future_to_path), total=len(potential_image_files), desc=f"Pairing/Filtering {data_dir.name}"):
+                path = future_to_path[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as exc:
+                    tqdm.write(f'Error processing {path}: {exc}')
+                    results.append({"status": "processing_error", "image_name": Path(path).name, "error": str(exc)})
 
-        for img_path_str in potential_image_files:
-            img_path = Path(img_path_str)
-            label_filename = img_path.name.replace('_image_', '_maskArtifact_', 1)
-            label_path = img_path.with_name(label_filename)
-
-            if label_path.is_file():
-                paired_files.append({"image_path": img_path_str, "seg_path": str(label_path)})
-            else:
-                tqdm.write(f"Warning: Derived label file {label_path.name} not found for image {img_path.name} in {data_dir}. Skipping.")
+        # Process the collected results
+        for result in results:
+             status = result.get("status")
+             if status == "paired":
+                 paired_files.append({"image_path": result["image_path"], "seg_path": result["seg_path"]})
+             elif status == "paired_key_missing":
+                 paired_files.append({"image_path": result["image_path"], "seg_path": result["seg_path"]})
+                 included_key_missing += 1
+                 tqdm.write(f"Including {result['image_path']} despite missing 'arr_0' in label for filtering.")
+             elif status == "paired_load_error":
+                 paired_files.append({"image_path": result["image_path"], "seg_path": result["seg_path"]})
+                 load_errors += 1
+                 tqdm.write(f"Warning: Error loading/checking label for {result['image_path']} during pre-filtering: {result.get('error', '')}. Including file.")
+             elif status == "filtered":
+                 filtered_out += 1
+             elif status == "missing_label":
                 missing_labels += 1
-        print(f"Successfully paired {len(paired_files)} files in {data_dir}. {missing_labels} missing labels.")
+                tqdm.write(f"Warning: Derived label file not found for image {result.get('image_name', 'N/A')} in {data_dir}. Skipping.")
+             elif status == "processing_error":
+                 # Decide how to handle overall processing errors, maybe increment a counter
+                 pass # Already logged by the tqdm loop
+
+        filter_msg = f" {filtered_out} files filtered out (no class 1 or 2 pixels)." if pre_filter_non_artifact else ""
+        error_msg = f" {load_errors} label load errors during filtering (included anyway)." if load_errors > 0 else ""
+        key_msg = f" {included_key_missing} included despite missing label key." if included_key_missing > 0 else ""
+        print(f"Successfully paired {len(paired_files)} files in {data_dir}.{filter_msg} {missing_labels} missing labels.{error_msg}{key_msg}")
         return paired_files, missing_labels
 
-    train_files_list, missing_train = find_and_pair_files(train_path, args.file_pattern)
-    validate_files_list, missing_val = find_and_pair_files(val_path, args.file_pattern)
-    test_files_list, missing_test = find_and_pair_files(test_path, args.file_pattern)
+    # Determine number of threads (can be made an argument later)
+    num_pairing_threads = max(1, os.cpu_count() // 2) # Use half the cores by default 
+
+    # Apply pre-filtering only to training/validation data
+    print(f"Using {num_pairing_threads} threads for file pairing/filtering.")
+    train_files_list, missing_train = find_and_pair_files(train_path, args.file_pattern, pre_filter_non_artifact=True, num_threads=num_pairing_threads)
+    validate_files_list, missing_val = find_and_pair_files(val_path, args.file_pattern, pre_filter_non_artifact=True, num_threads=num_pairing_threads)
+    # Keep all test files for comprehensive evaluation, do not pre-filter
+    test_files_list, missing_test = find_and_pair_files(test_path, args.file_pattern, pre_filter_non_artifact=False, num_threads=num_pairing_threads) 
 
     train_files = train_files_list + validate_files_list
     test_files = test_files_list
@@ -349,13 +529,41 @@ def main(args):
     img_key = "image"
     seg_key = "seg"
 
+    # Define foreground labels for cropping
+    foreground_labels = [1, 2]
+
+    # --- Original transforms with interspersed logging --- 
+    # print("DEBUG: Using simplified transforms (Load, Channel, Orient, Resize)")
     base_transforms = [
         LoadPairedArr0d(keys=("image_path", "seg_path")),
-        EnsureChannelFirstd(keys=[img_key, seg_key], channel_dim="no_channel"),
-        Orientationd(keys=[img_key, seg_key], axcodes="RAS"),
-        Spacingd(keys=[img_key, seg_key], pixdim=args.target_spacing, mode=("bilinear", "nearest")),
-        Resized(keys=[img_key, seg_key], spatial_size=args.input_size, mode=("bilinear", "nearest")),
+        LogKeysd(keys=(), log_prefix="After LoadPairedArr0d"), # Log after loading
+
+        EnsureChannelFirstd(keys=[img_key, seg_key], channel_dim="no_channel", allow_missing_keys=True),
+        LogKeysd(keys=(), log_prefix="After EnsureChannelFirstd"), # Log after channel
+
+        Orientationd(keys=[img_key, seg_key], axcodes="RAS", allow_missing_keys=True),
+        LogKeysd(keys=(), log_prefix="After Orientationd"), # Log after orientation
+
+        # Crop based on foreground labels before expensive transforms
+        RandCropByPosNegLabeld(
+            keys=[img_key, seg_key],
+            label_key=seg_key,
+            spatial_size=args.input_size,
+            pos=0.8, # PREFER foreground center (80%)
+            neg=0.2, # ALLOW background center (20%) as fallback
+            num_samples=1,
+            allow_smaller=True # Allow smaller output if input is smaller than crop size
+        ),
+        LogKeysd(keys=(), log_prefix="After RandCropByPosNegLabeld"), # Log after crop
+
+        Spacingd(keys=[img_key, seg_key], pixdim=args.target_spacing, mode=("bilinear", "nearest"), allow_missing_keys=True),
+        LogKeysd(keys=(), log_prefix="After Spacingd"), # Log after spacing
+        
+        # Resized might be redundant now if spatial_size in RandCropByPosNegLabeld == args.input_size
+        # Resized(keys=[img_key, seg_key], spatial_size=args.input_size, mode=("bilinear", "nearest"), allow_missing_keys=True), 
+        # LogKeysd(keys=(), log_prefix="After Resized"), # Log after resize (if used)
     ]
+    # --- END Original transforms with logging --- 
 
     try:
         augmentations_result = get_augmentations()
@@ -404,7 +612,25 @@ def main(args):
     )
 
     print("Setting up MONAI test data loader...")
-    test_ds = ArtifactDataset(data_dicts=test_files, transforms=test_transforms) if test_files else None
+    # Use standard MONAI dataset/dataloader for testing as it doesn't need batchgenerators structure
+    # Make sure test_transforms match what the model expects (e.g., output Tensors)
+    # Apply cropping to test set as well for consistency?
+    # If yes, use CenterSpatialCropd instead of random
+    # from monai.transforms import CenterSpatialCropd 
+    test_compose = Compose([
+        LoadPairedArr0d(keys=("image_path", "seg_path")), # Load NPZ
+        EnsureChannelFirstd(keys=[img_key, seg_key], channel_dim="no_channel"),
+        Orientationd(keys=[img_key, seg_key], axcodes="RAS"),
+        # Option: Apply Center Crop to test set for consistency
+        # CenterSpatialCropd(keys=[img_key, seg_key], roi_size=args.input_size),
+        Spacingd(keys=[img_key, seg_key], pixdim=args.target_spacing, mode=("bilinear", "nearest")),
+        Resized(keys=[img_key, seg_key], spatial_size=args.input_size, mode=("bilinear", "nearest")), # Keep resize if not cropping test
+        # Define a transform to get the label *after* initial processing
+        GetLabelFromSegd(keys=[seg_key], label_key='label', min_pixels_threshold=args.min_artifact_pixels),
+        EnsureTyped(keys=[img_key, 'label'], dtype=(torch.float32, torch.int64)), # Ensure image is float, label is long
+    ])
+
+    test_ds = monai.data.Dataset(data=test_files, transform=test_compose) if test_files else None
 
     print("Getting batchgenerators transforms from Augmentations.py...")
     bg_transforms = get_augmentations()
@@ -419,6 +645,8 @@ def main(args):
         num_cached_per_queue=3,
         pin_memory=True,
         seeds=None,
+        useroi=False, # Disable ROI calculation
+        generate_patches=False # Disable patch generation
     )
     print("MultiThreadedAugmenter initialized.")
 
@@ -436,20 +664,27 @@ def main(args):
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    num_output_classes = 2 # Targeting artifact classes 1 and 2 only
+    print(f"Model configured for {num_output_classes} output classes (Artifact 1, Artifact 2)")
     model = DenseNet121(
         spatial_dims=3,
         in_channels=1,
-        out_channels=args.num_classes
+        # out_channels=args.num_classes
+        out_channels=num_output_classes # Set to 2
     ).to(device)
 
     if args.use_weighted_loss:
-        # IMPORTANT: These weights are ESTIMATES. Ideal weights depend on the distribution *after* transforms.
+        if len(args.class_weights) != num_output_classes:
+             raise ValueError(f"Expected {num_output_classes} class weights for 2-class output, but got {len(args.class_weights)}. Weights should correspond to original classes 1 and 2.")
+        # Weights correspond to mapped classes 0 (original 1) and 1 (original 2)
         weights = torch.tensor(args.class_weights).float().to(device)
-        print(f"Using weighted CrossEntropyLoss. Weights (C0, C1, C2): {weights.cpu().numpy()}")
-        criterion = FocalLoss(alpha=weights, gamma=2)
+        print(f"Using weighted CrossEntropyLoss for 2 classes. Weights (Orig Cls 1, Orig Cls 2): {weights.cpu().numpy()}")
+        # criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=0)
+        criterion = nn.CrossEntropyLoss(weight=weights)
     else:
-        print("Using standard CrossEntropyLoss.")
-        criterion = FocalLoss(alpha=weights, gamma=2)
+        print("Using standard CrossEntropyLoss for 2 classes.")
+        # criterion = nn.CrossEntropyLoss(ignore_index=0)
+        criterion = nn.CrossEntropyLoss()
 
     if args.optimizer.lower() == 'adamw':
         optimizer = optim.AdamW(model.parameters(), lr=args.initial_lr, weight_decay=args.weight_decay)
@@ -509,91 +744,100 @@ def main(args):
         train_steps = 0
         train_correct = 0
         train_total = 0
+        train_correct_12 = 0 # Correct predictions for class 1 vs 2
+        train_total_12 = 0   # Total samples of class 1 vs 2
         recent_train_losses = [] # For moving average
-        recent_train_accuracies = [] # For moving average
-
-        ema_loss = 0.0 # Initialize differently for first update
-        ema_acc = None
-
-        alpha = 2.0 / (args.log_freq + 1) if args.log_freq > 0 else 0.5 # Smoothing factor
+        recent_train_accuracies_12 = [] # For moving average of 1-vs-2 accuracy
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch} Train", unit="batch", leave=False)
         for batch_data in progress_bar:
             try:
-                 if not batch_data or 'data' not in batch_data or 'label' not in batch_data:
-                     tqdm.write(f"Warning: Skipping empty or invalid batch from train_loader in epoch {epoch}.")
-                     continue
+                if not batch_data or 'data' not in batch_data or 'label' not in batch_data:
+                    tqdm.write(f"Warning: Skipping empty or invalid batch from train_loader in epoch {epoch}.")
+                    continue
 
-                 image_np = batch_data['data']
-                 label_np = batch_data['label']
+                image_batch = batch_data['data']
+                label_batch = batch_data['label']
 
-                 inputs = torch.from_numpy(image_np).float().to(device)
-                 labels = torch.from_numpy(label_np).long().to(device)
+                # Handle data type: could be np.ndarray or torch.Tensor
+                if isinstance(image_batch, np.ndarray):
+                    inputs = torch.from_numpy(image_batch).float().to(device)
+                elif isinstance(image_batch, torch.Tensor):
+                    inputs = image_batch.float().to(device)
+                else:
+                    tqdm.write(f"Warning: Unexpected type for image batch: {type(image_batch)}. Skipping batch.")
+                    continue
 
-            except Exception as e:
-                 tqdm.write(f"Error converting batch from MultiThreadedAugmenter output to tensors: {e}")
+                # Handle label type: could be np.ndarray or torch.Tensor (less likely but safe)
+                if isinstance(label_batch, np.ndarray):
+                    # Labels are 1 or 2 from loader
+                    labels_1_2 = torch.from_numpy(label_batch).long().to(device)
+                elif isinstance(label_batch, torch.Tensor):
+                    labels_1_2 = label_batch.long().to(device)
+                else:
+                    tqdm.write(f"Warning: Unexpected type for label batch: {type(label_batch)}. Skipping batch.")
+                    continue
+                
+                # Map labels 1, 2 to 0, 1 for 2-class loss
+                mapped_labels = labels_1_2 - 1
+
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                # Loss expects outputs (B, 2) and mapped_labels (B,) containing 0 or 1
+                loss = criterion(outputs, mapped_labels)
+                loss.backward()
+                optimizer.step()
+
+                current_loss = loss.item()
+                train_loss += loss.item()
+                train_steps += 1
+
+                recent_train_losses.append(current_loss)
+                if len(recent_train_losses) > args.log_freq:
+                    recent_train_losses.pop(0)
+
+                    _, predicted_mapped = torch.max(outputs.data, 1)
+                    batch_total_samples = mapped_labels.size(0)
+                    batch_correct_mapped = (predicted_mapped == mapped_labels).sum().item()
+                    
+                    # Since all samples reaching here should be class 1 or 2, total_12 == total_samples
+                    train_correct_12 += batch_correct_mapped 
+                    train_total_12 += batch_total_samples
+                    batch_accuracy_12 = (batch_correct_mapped / batch_total_samples) * 100 if batch_total_samples > 0 else 0
+
+                    recent_train_accuracies_12.append(batch_accuracy_12)
+                    if len(recent_train_accuracies_12) > args.log_freq:
+                        recent_train_accuracies_12.pop(0)
+
+                if wandb_enabled and train_steps % args.log_freq == 0:
+                    moving_avg_loss = np.mean(recent_train_losses) if recent_train_losses else current_loss
+                    wandb.log({
+                        "train/step_loss": current_loss,
+                        "train/step_loss_moving_avg": moving_avg_loss,
+                            "train/step_accuracy_12": batch_accuracy_12,
+                            "train/step_accuracy_12_moving_avg": np.mean(recent_train_accuracies_12) if recent_train_accuracies_12 else batch_accuracy_12,
+                        "epoch": epoch + (train_steps / batches_per_epoch)
+                    }, step=epoch * batches_per_epoch + train_steps)
+
+                if train_steps > 0:
+                    moving_avg_loss = np.mean(recent_train_losses) if recent_train_losses else current_loss
+                    moving_avg_acc_12 = np.mean(recent_train_accuracies_12) if recent_train_accuracies_12 else batch_accuracy_12
+                    progress_bar.set_postfix(
+                            loss=f"{moving_avg_loss:.4f}",
+                            acc12=f"{moving_avg_acc_12:.2f}%"
+                        )
+
+            except KeyError as e:
+                 tqdm.write(f"Error: Missing key {e} in batch data from MultiThreadedAugmenter.")
                  tqdm.write(f"Batch keys: {batch_data.keys() if isinstance(batch_data, dict) else type(batch_data)}")
-                 if isinstance(batch_data, dict):
-                      for k in ['data', 'label', 'seg']:
-                          if k in batch_data:
-                               v = batch_data[k]
-                               tqdm.write(f"  {k}: {type(v)}, shape: {getattr(v, 'shape', 'N/A')}")
+                 continue # Skip this batch
+            except Exception as e:
+                 tqdm.write(f"Error processing batch from MultiThreadedAugmenter: {e}")
                  continue # Skip this batch
 
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            current_loss = loss.item()
-            train_loss += loss.item()
-            train_steps += 1
-
-            recent_train_losses.append(current_loss)
-            if len(recent_train_losses) > args.log_freq:
-                recent_train_losses.pop(0)
-
-            _, predicted = torch.max(outputs.data, 1)
-            batch_total = labels.size(0)
-            batch_correct = (predicted == labels).sum().item()
-            batch_accuracy = (batch_correct / batch_total) * 100 if batch_total > 0 else 0
-
-            recent_train_accuracies.append(batch_accuracy)
-            if len(recent_train_accuracies) > args.log_freq:
-                 recent_train_accuracies.pop(0)
-
-            if train_steps == 1:
-                 ema_loss = current_loss
-                 ema_acc = batch_accuracy
-            else:
-                 ema_loss = alpha * current_loss + (1 - alpha) * ema_loss
-                 ema_acc = alpha * batch_accuracy + (1 - alpha) * ema_acc
-
-            train_total += batch_total
-            train_correct += batch_correct
-
-            if wandb_enabled and train_steps % args.log_freq == 0:
-                moving_avg_loss = np.mean(recent_train_losses) if recent_train_losses else current_loss
-                wandb.log({
-                    "train/step_loss": current_loss,
-                    "train/step_loss_moving_avg": moving_avg_loss,
-                    "train/step_accuracy": batch_accuracy,
-                    "train/step_accuracy_moving_avg": np.mean(recent_train_accuracies) if recent_train_accuracies else batch_accuracy,
-                    "epoch": epoch + (train_steps / batches_per_epoch)
-                }, step=epoch * batches_per_epoch + train_steps)
-
-            if train_steps > 0:
-                 moving_avg_loss = np.mean(recent_train_losses) if recent_train_losses else current_loss
-                 moving_avg_acc = np.mean(recent_train_accuracies) if recent_train_accuracies else batch_accuracy
-                 progress_bar.set_postfix(
-                     loss_ema=f"{ema_loss:.4f}",
-                     acc_ema=f"{ema_acc:.2f}%"
-                 )
-
         avg_train_loss = train_loss / train_steps if train_steps > 0 else 0
-        train_accuracy = 100 * train_correct / train_total if train_total > 0 else 0
-        print(f"Epoch {epoch} Average Training Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.2f}%")
+        train_accuracy_12 = 100 * train_correct_12 / train_total_12 if train_total_12 > 0 else 0
+        print(f"Epoch {epoch} Average Training Loss: {avg_train_loss:.4f}, Accuracy (Cls 1&2): {train_accuracy_12:.2f}% ({train_correct_12}/{train_total_12})")
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -609,122 +853,142 @@ def main(args):
         if test_loader:
             test_loss = 0
             test_steps = 0
-            all_preds = []
-            all_labels = []
+            all_preds_mapped = [] # Store model predictions (0 or 1)
+            all_labels_mapped = [] # Store mapped ground truth (0 or 1)
             print(f"Running Testing for Epoch {epoch}...")
 
             with torch.no_grad():
                 for batch_data in tqdm(test_loader, desc=f"Epoch {epoch} Test", unit="batch", leave=False):
-                    inputs = batch_data["image"].to(device)
-                    labels = batch_data["label"].to(device)
-                    test_outputs = model(inputs)
-                    loss = criterion(test_outputs, labels)
+                    # Handle data type consistency for validation/test loader as well
+                    image_batch = batch_data["image"]
+                    label_batch = batch_data["label"]
 
-                    test_loss += loss.item()
-                    test_steps += 1
+                    if isinstance(image_batch, np.ndarray):
+                        inputs = torch.from_numpy(image_batch).float().to(device)
+                    elif isinstance(image_batch, torch.Tensor):
+                        inputs = image_batch.float().to(device)
+                    else:
+                         tqdm.write(f"Warning: Unexpected type for test image batch: {type(image_batch)}. Skipping.")
+                         continue
+                    
+                    if isinstance(label_batch, np.ndarray):
+                        labels_0_1_2 = torch.from_numpy(label_batch).long().to(device)
+                    elif isinstance(label_batch, torch.Tensor):
+                        labels_0_1_2 = label_batch.long().to(device) # Ensure long type
+                    else:
+                         tqdm.write(f"Warning: Unexpected type for test label batch: {type(label_batch)}. Skipping.")
+                         continue
+                    
+                    # Filter out samples with label 0 for metrics
+                    mask_1_2 = (labels_0_1_2 != 0)
+                    
+                    if not torch.any(mask_1_2):
+                        continue # Skip batch if no class 1 or 2 samples
+                        
+                    inputs_filtered = inputs[mask_1_2]
+                    labels_1_2_filtered = labels_0_1_2[mask_1_2]
+                    
+                    # Map 1, 2 -> 0, 1 for loss calculation (if needed) and metrics
+                    mapped_labels_filtered = labels_1_2_filtered - 1
+                   
+                    # Get model output for filtered inputs
+                    test_outputs = model(inputs_filtered)
+                    # Calculate loss only on relevant samples (using mapped labels)
+                    loss = criterion(test_outputs, mapped_labels_filtered)
 
-                    _, predicted = torch.max(test_outputs.data, 1)
-                    all_preds.extend(predicted.cpu().numpy())
-                    all_labels.extend(labels.cpu().numpy())
+                    test_loss += loss.item() * mapped_labels_filtered.size(0) # Weight loss by number of valid samples
+                    test_steps += mapped_labels_filtered.size(0) # Count valid samples
+
+                    _, predicted_mapped = torch.max(test_outputs.data, 1)
+                    all_preds_mapped.extend(predicted_mapped.cpu().numpy())
+                    all_labels_mapped.extend(mapped_labels_filtered.cpu().numpy())
 
             avg_test_loss = test_loss / test_steps if test_steps > 0 else 0
-            test_accuracy = accuracy_score(all_labels, all_preds) * 100 if all_labels else 0
+            # Calculate accuracy using the mapped predictions and labels (0 and 1)
+            test_accuracy_12 = accuracy_score(all_labels_mapped, all_preds_mapped) * 100 if all_labels_mapped else 0
 
-            print(f"Epoch {epoch} Average Test Loss: {avg_test_loss:.4f}, Accuracy: {test_accuracy:.2f}%")
+            # --- Filter for 1-vs-2 accuracy --- REMOVED (Already filtered)
+            # filtered_pairs = [(p, l) for p, l in zip(all_preds, all_labels) if l != 0]
+            # test_accuracy_12 = np.nan
+            # report_12 = "N/A"
+            # cm_12 = None
 
-            test_metrics["test/epoch_loss"] = avg_test_loss
-            test_metrics["test/epoch_accuracy"] = test_accuracy
-
-            if all_labels:
-                target_names = [f"Class_{i}" for i in range(args.num_classes)]
+            # if filtered_pairs:
+            #     filtered_preds = [p for p, l in filtered_pairs]
+            #     filtered_labels = [l for p, l in filtered_pairs]
+            #     test_accuracy_12 = accuracy_score(filtered_labels, filtered_preds) * 100
+            target_names_12 = ["Artifact1", "Artifact2"] # Target names for the 2 classes
+            report_12 = "N/A"
+            cm_12 = None
+            if all_labels_mapped:
                 try:
-                    report = classification_report(all_labels, all_preds, target_names=target_names, zero_division=0)
-                    print("Test Classification Report:")
-                    print(report)
-
-                    cm = confusion_matrix(all_labels, all_preds)
-                    print("Test Confusion Matrix:")
-                    print(cm)
-
-                    if wandb_enabled:
-                        try:
-                            report_dict = classification_report(all_labels, all_preds, target_names=target_names, zero_division=0, output_dict=True)
-                            for class_name, metrics_dict in report_dict.items():
-                                if isinstance(metrics_dict, dict):
-                                    for metric_name, value in metrics_dict.items():
-                                        test_metrics[f"test_report/{class_name}_{metric_name}"] = value
-                                else:
-                                    test_metrics[f"test_report/{class_name}"] = metrics_dict
-
-                            test_metrics["test/confusion_matrix"] = wandb.Table(
-                                columns=target_names,
-                                data=cm.tolist(),
-                                rows=target_names
-                            )
-
-                        except Exception as report_e:
-                            print(f"Warning: Could not format detailed report/cm for WandB: {report_e}")
-
+                    report_12 = classification_report(all_labels_mapped, all_preds_mapped, target_names=target_names_12, zero_division=0)
+                    # CM labels should be 0, 1
+                    cm_12 = confusion_matrix(all_labels_mapped, all_preds_mapped, labels=[0, 1]) 
                 except ValueError as e:
-                    print(f"Could not generate classification report (likely due to missing classes in batch): {e}")
-        else:
-             print(f"Epoch {epoch} - No testing performed (test directory empty or issue loading).")
+                    print(f"Could not generate classification report/CM for test data: {e}")
+            # else:
+            #     print("No samples of class 1 or 2 found in test set after filtering.")
+            # --- End filtering ---
 
-        # --- Checkpointing ---
-        epoch_metric = test_accuracy
+            # print(f"Epoch {epoch} Average Test Loss: {avg_test_loss:.4f}, Overall Accuracy: {test_accuracy:.2f}%, Accuracy (Cls 1&2): {test_accuracy_12:.2f}%")
+            print(f"Epoch {epoch} Average Test Loss (Cls 1&2): {avg_test_loss:.4f}, Test Accuracy (Cls 1&2): {test_accuracy_12:.2f}%")
 
-        current_best_metric = best_metric if not np.isnan(best_metric) else -1
-        is_best = False
-        if not np.isnan(epoch_metric):
-            is_best = epoch_metric > current_best_metric
+            # Log both overall and filtered accuracy
+            test_metrics["test/epoch_loss_12"] = avg_test_loss
+            # test_metrics["test/epoch_accuracy_overall"] = test_accuracy 
+            test_metrics["test/epoch_accuracy_12"] = test_accuracy_12
 
-        latest_checkpoint_path = run_output_dir / "checkpoint_latest.pt"
-        checkpoint_data = {
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_metric': best_metric,
-            'best_metric_epoch': best_metric_epoch,
-            'test_accuracy': epoch_metric
-        }
-        torch.save(checkpoint_data, latest_checkpoint_path)
-        print(f"Saved latest checkpoint to {latest_checkpoint_path.name}")
+            # Log filtered report and CM if available
+            # if filtered_pairs and cm_12 is not None:
+            if all_labels_mapped and cm_12 is not None:
+                # target_names = [f"Class_{i}" for i in range(args.num_classes)]
+                print("Test Classification Report (Artifact 1 vs 2):")
+                print(report_12)
+                print("Test Confusion Matrix (Artifact 1 vs 2):")
+                print(cm_12)
 
-        if is_best:
-            best_metric = epoch_metric
             if wandb_enabled:
-                wandb.summary['best_test_accuracy'] = best_metric
-                wandb.summary['best_test_epoch'] = epoch
+                    try:
+                        # Log the filtered report dictionary
+                        report_dict_12 = classification_report(all_labels_mapped, all_preds_mapped, target_names=target_names_12, zero_division=0, output_dict=True)
+                        for class_name, metrics_dict in report_dict_12.items():
+                            if isinstance(metrics_dict, dict):
+                                for metric_name, value in metrics_dict.items():
+                                    test_metrics[f"test_report_12/{class_name}_{metric_name}"] = value
+                            else:
+                                test_metrics[f"test_report_12/{class_name}"] = metrics_dict
+                         
+                        # Log the filtered confusion matrix
+                        test_metrics["test/confusion_matrix_12"] = wandb.Table(
+                            columns=target_names_12, # Use 2 class names
+                            data=cm_12.tolist(),
+                            rows=target_names_12 # Use 2 class names
+                        )
 
-            best_metric_epoch = epoch
-            best_checkpoint_path = run_output_dir / "checkpoint_best.pt"
-            shutil.copyfile(latest_checkpoint_path, best_checkpoint_path)
-            print(f"Saved new best checkpoint (Test Accuracy: {best_metric:.2f}%) to {best_checkpoint_path.name}")
-        else:
-             print(f"Metric ({epoch_metric:.2f}%) did not improve from best ({best_metric:.2f}% at epoch {best_metric_epoch}).")
+                    except Exception as report_e:
+                        print(f"Warning: Could not format detailed filtered report/cm for WandB: {report_e}")
+                        # Delete old logging for overall report/cm
+                        # if all_labels:
+                        #     target_names = [f"Class_{i}" for i in range(args.num_classes)]
 
-        epoch_duration = time.time() - epoch_start_time
-        print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
-
-        with open(log_file, 'a') as f:
-             f.write(f"Epoch: {epoch}, Train Loss: {avg_train_loss:.4f}, Train Acc: {train_accuracy:.2f}, "
-                     f"Test Loss: {avg_test_loss:.4f}, Test Acc: {test_accuracy:.2f}, LR: {current_lr:.6f}")
-             if all_labels and 'report' in locals() and 'cm' in locals():
-                 f.write("Test Report:")
-                 f.write(str(report) + "")
-                 f.write("Test Confusion Matrix:")
-                 f.write(np.array2string(cm) + "")
-             f.write("-" * 20 + "")
+                    f.write(f"Epoch: {epoch}, Train Loss: {avg_train_loss:.4f}, Train Acc (1&2): {train_accuracy_12:.2f}, "
+                    f"Test Loss: {avg_test_loss:.4f}, Test Acc (1&2): {test_accuracy_12:.2f}, LR: {current_lr:.6f}")
+            if all_labels_mapped and cm_12 is not None:
+                f.write("\nTest Report (1&2):\n")
+                f.write(str(report_12) + "\n")
+                f.write("Test Confusion Matrix (1&2):\n")
+                f.write(np.array2string(cm_12) + "\n")
+            f.write("-" * 20 + "\n")
 
         if wandb_enabled:
              wandb.log(test_metrics, step=epoch * batches_per_epoch + batches_per_epoch)
              moving_avg_loss_epoch_end = np.mean(recent_train_losses) if recent_train_losses else avg_train_loss
              wandb.log({
                  "train/epoch_loss": avg_train_loss,
-                 "train/epoch_accuracy": train_accuracy,
+                 "train/epoch_accuracy_12": train_accuracy_12,
                  "train/epoch_loss_moving_avg": moving_avg_loss_epoch_end,
-                 "train/epoch_accuracy_moving_avg": np.mean(recent_train_accuracies) if recent_train_accuracies else train_accuracy,
+                 "train/epoch_accuracy_12_moving_avg": np.mean(recent_train_accuracies_12) if recent_train_accuracies_12 else train_accuracy_12,
                  "learning_rate": current_lr,
                  "epoch": epoch
              }, step=epoch * batches_per_epoch + batches_per_epoch)
@@ -770,8 +1034,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_weighted_loss', action=argparse.BooleanOptionalAction, default=True,
                         help='Use weighted CrossEntropyLoss based on class distribution.')
     # Default weights based on transformed distribution (Fold 0) with capped Class 0 weight
-    parser.add_argument('--class_weights', type=float, nargs=3, default=[2, 1.27, 1],
-                        help='Weights for Class 0, 1, 2 for weighted loss. Ignored if --no_use_weighted_loss.')
+    # Weights now correspond to original class 1 and class 2 mapped to 0 and 1
+    parser.add_argument('--class_weights', type=float, nargs=2, default=[1.5, 1],
+                        help='Weights for Artifact Class 1 and Artifact Class 2 (mapped to outputs 0, 1) for weighted loss. Ignored if --no_use_weighted_loss.')
 
     # --- System Arguments ---
     parser.add_argument('--device', type=int, default=0, help="GPU device ID to use.")
@@ -790,5 +1055,8 @@ if __name__ == "__main__":
 
     if args.num_classes <= 1:
          raise ValueError("num_classes must be at least 2 for classification.")
+    # Add check for class weights length if used
+    if args.use_weighted_loss and len(args.class_weights) != 2:
+        raise ValueError(f"--class_weights must provide exactly 2 weights when using 2-class output, but got {len(args.class_weights)}.")
 
     main(args) 
