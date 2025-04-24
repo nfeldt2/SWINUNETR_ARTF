@@ -175,25 +175,27 @@ class MaskedDiceLoss(nn.Module):
 
     def forward(self, seg_logits: torch.Tensor, seg_targets: torch.Tensor) -> torch.Tensor:
         # seg_logits: [B, C, D, H, W], seg_targets: [B, D, H, W]
-        probs = F.softmax(seg_logits, dim=1)
-        one_hot_gt = one_hot(seg_targets, num_classes=self.num_classes)
-        dice_sum = torch.tensor(0.0, device=seg_logits.device)
-        count = 0
-        # iterate classes
+        probs = F.softmax(seg_logits, dim=1)  # [B, C, D, H, W]
+        gt_onehot = one_hot(seg_targets, num_classes=self.num_classes)  # [B, C, D, H, W]
+        losses = []
+        B = seg_logits.shape[0]
+        # compute per-sample, per-class dice
         for c in range(self.num_classes):
             if c == 0 and self.ignore_background:
                 continue
-            gt_c = one_hot_gt[:, c, ...].float()
-            if gt_c.sum() > 0:
-                pred_c = probs[:, c, ...]
-                inter = (pred_c * gt_c).sum()
-                denom = pred_c.sum() + gt_c.sum()
-                dice_c = 1.0 - 2.0 * inter / (denom + self.eps)
-                dice_sum += dice_c
-                count += 1
-        if count > 0:
-            return self.lambda_term * dice_sum / count
-        # no classes to include
+            for b in range(B):
+                gt_c = gt_onehot[b, c, ...].float()
+                if gt_c.sum() > 0:
+                    pred_c = probs[b, c, ...]
+                    inter = (pred_c * gt_c).sum()
+                    denom = pred_c.sum() + gt_c.sum()
+                    dice_c = 1.0 - 2.0 * inter / (denom + self.eps)
+                    losses.append(dice_c)
+                else:
+                    losses.append(torch.tensor(0.0, device=seg_logits.device))
+        if losses:
+            return self.lambda_term * torch.stack(losses).mean()
+        # no classes to include anywhere
         return torch.tensor(0.0, device=seg_logits.device)
 
 # --- get_image_label (Not strictly needed for seg task, but used by loader) ---
