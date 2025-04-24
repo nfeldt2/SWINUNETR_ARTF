@@ -1110,21 +1110,26 @@ def main(args):
                                     print(f"  Class {c} probs: min={channel.min().item():.4f}, max={channel.max().item():.4f}, mean={channel.mean().item():.4f}")
                     except Exception as e: print(f"Validation inference error: {e}"); continue
 
-                    try: # Validation Loss
-                         loss = criterion(seg_logits, seg_targets)
+                    try:  # Validation Loss (match training loss formula)
+                         # dice component
+                         dice_loss = criterion(seg_logits, seg_targets)
+                         # segmentation CE component (squeeze channel dim)
+                         seg_ce_loss = seg_ce_criterion(seg_logits, seg_targets.squeeze(1))
+                         # combine dice and CE with weights
+                         loss_val = args.lambda_dice * dice_loss + args.lambda_ce * seg_ce_loss
                          if class_logits is not None:
-                             # standard classification loss
+                             # classification head CE
                              class_loss = class_criterion(class_logits, class_targets)
-                             # seg-derived classification loss (artifact 1 vs 2)
+                             # seg-derived classification CE
                              mask = class_targets > 0
                              if mask.any():
                                  seg_bin_targets = (class_targets[mask] == 2).long()
-                                 probs_masked = vol_probs[mask].clamp(min=1e-6)
-                                 class_probs_loss = F.nll_loss(torch.log(probs_masked), seg_bin_targets)
+                                 class_probs_loss = F.nll_loss(torch.log(class_probs[mask]), seg_bin_targets)
                              else:
                                  class_probs_loss = torch.tensor(0.0, device=device)
-                             loss = loss + class_loss + class_probs_loss
-                         val_loss += loss.item()
+                             # mirror train: weighted classification sub-loss
+                             loss_val = loss_val + class_weight * (class_loss + class_weight * class_probs_loss)
+                         val_loss += loss_val.item()
                     except Exception as e: print(f"Validation loss error: {e}"); continue
 
                     try: # Validation Metric
@@ -1162,7 +1167,7 @@ def main(args):
                          if class_logits is not None:
                              class_accs = val_accuracy_tracker.update(class_logits, class_targets)
                              val_pbar.set_postfix(
-                                 loss=f"{loss.item():.4f}",
+                                 loss=f"{loss_val.item():.4f}",
                                  cls1_acc=f"{class_accs.get(1, 0):.4f}",
                                  cls2_acc=f"{class_accs.get(2, 0):.4f}"
                              )
