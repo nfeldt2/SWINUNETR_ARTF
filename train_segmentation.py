@@ -855,7 +855,7 @@ def main(args):
         recent_train_losses = []
         
         # Initialize class accuracy tracker for this epoch
-        train_accuracy_tracker = ClassAccuracyEMA(classes_to_track=[1, 2], alpha=0.95)
+        train_accuracy_tracker = ClassAccuracyEMA(classes_to_track=[1, 2], alpha=0.98)
 
         # --- NO RESTART CALL ---
 
@@ -877,6 +877,7 @@ def main(args):
         for batch_data in progress_bar:
             # Expecting 'data', 'seg', 'label' (label might be ignored)
             if not isinstance(batch_data, dict) or 'data' not in batch_data or 'seg' not in batch_data or batch_data['data'].size == 0:
+                print(f"Training: Batch data keys: {batch_data.keys()}")
                 continue # Skip incomplete batch
             train_steps += 1
 
@@ -1060,9 +1061,11 @@ def main(args):
                 )
                 for batch_data in val_pbar:
                     # Validation loader outputs Tensors: {'image', 'seg'} (or maybe 'seg_target' if not changed)
-                    if 'image' not in batch_data or 'seg' not in batch_data: continue # Adjust keys based on val_transforms output
+                    if 'image' not in batch_data or 'seg' not in batch_data: 
+                        print(f"Test: keys in batch_data: {batch_data.keys()}")
+                        continue # Adjust keys based on val_transforms output
 
-                    inputs = torch.tensor(batch_data['data']).to(device).float()
+                    inputs = torch.tensor(batch_data['image']).to(device).float()
                     seg_targets = torch.tensor(batch_data['seg']).to(device).long() # Use 'seg', ensure Long
                     
                     # Apply target remapping
@@ -1333,7 +1336,7 @@ if __name__ == "__main__":
     parser.add_argument('dataset_dir', type=str)
     parser.add_argument('--output_dir', type=str, default='./results_segmentation') # Changed default
     parser.add_argument('--file_pattern', type=str, default='*.np[yz]')
-    parser.add_argument('--num_workers', type=int, default=8, help="Num workers for MTA")
+    parser.add_argument('--num_workers', type=int, default=12, help="Num workers for MTA")
     parser.add_argument('--num_workers_val', type=int, default=4, help="Num workers for MONAI val loader")
 
     parser.add_argument('--num_seg_classes', type=int, required=True, help="Number of segmentation output classes (e.g., 3 for Bkg, Art1, Art2).")
