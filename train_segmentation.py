@@ -889,6 +889,19 @@ def main(args):
         scale_dice = args.epochs / 4.0
         dice_weight = 1.0 + (args.lambda_ce - 1.0) * 0.5 * (1.0 + math.tanh((epoch - mid_dice) / scale_dice))
         print(f"Dynamic dice weight: {dice_weight:.3f} at epoch {epoch}")
+        # dynamic foreground sampling prob ramp from args.foreground_prob to 0.40
+        init_fore = args.foreground_prob
+        target_fore = 0.40
+        # reuse the dice mid/scale for foreground ramp
+        fore_ramp = target_fore + (init_fore - target_fore) * (
+            1 - 0.5 * (1.0 + math.tanh((epoch - mid_dice) / scale_dice))
+        )
+        # update manual loader if present
+        try:
+            train_dl.pos_fraction = float(fore_ramp)
+            print(f"Foreground sampling prob set to: {train_dl.pos_fraction:.3f}")
+        except Exception:
+            pass
         for batch_data in progress_bar:
             # Expecting 'data', 'seg', 'label' (label might be ignored)
             if not isinstance(batch_data, dict) or 'data' not in batch_data or 'seg' not in batch_data or batch_data['data'].size == 0:
