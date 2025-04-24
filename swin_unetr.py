@@ -72,6 +72,7 @@ class SwinUNETR(nn.Module):
         use_v2=False,
         kan= False, 
         deep_supervision=False,
+        num_classification_outputs=1,
     ) -> None:
         """
         Args:
@@ -134,6 +135,7 @@ class SwinUNETR(nn.Module):
 
         self.normalize = normalize
         self.deep_supervision = deep_supervision
+        self.num_classification_outputs = num_classification_outputs
 
         self.swinViT = SwinTransformer(
             in_chans=in_channels,
@@ -152,7 +154,7 @@ class SwinUNETR(nn.Module):
             spatial_dims=spatial_dims,
             downsample=look_up_option(downsample, MERGING_MODE) if isinstance(downsample, str) else downsample,
             use_v2=use_v2,
-            kan=kan
+            kan=False
         )
 
         self.encoder1 = UnetrBasicBlock(
@@ -255,7 +257,7 @@ class SwinUNETR(nn.Module):
         )
 
         # Main output block (highest resolution)
-        self.final_out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=1)
+        self.final_out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=self.num_classification_outputs)
 
         # --- Deep Supervision Heads (if enabled) ---
         if self.deep_supervision:
@@ -263,6 +265,17 @@ class SwinUNETR(nn.Module):
             self.ds_2 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 2, out_channels=1) # From decoder2 output
             self.ds_3 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 4, out_channels=1) # From decoder3 output
             self.ds_4 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 8, out_channels=1) # From decoder4 output
+
+        self.num_classes_classification = num_classification_outputs # Binary: Class 1 vs Not Class 1
+        # Example classification head (adjust based on bottleneck feature size: 16 * feature_size)
+        bottleneck_features = 16 * feature_size
+        self.classification_gap = nn.AdaptiveAvgPool3d(4) # Global Average Pooling
+        self.classification_head = nn.Sequential(
+            nn.Linear(bottleneck_features*4*4*4, 512), # Example MLP layer
+            nn.LeakyReLU(),
+            nn.Dropout(0.5), # Example dropout
+            nn.Linear(512, self.num_classes_classification) # Output 1 logit
+        )
 
         self.apply(self._init_weights)
 
@@ -284,12 +297,22 @@ class SwinUNETR(nn.Module):
         enc1 = self.encoder2(hidden_states_out[0])
         enc2 = self.encoder3(hidden_states_out[1])
         enc3 = self.encoder4(hidden_states_out[2])
-        dec4 = self.encoder10(hidden_states_out[4])
+        dec4 = self.encoder10(hidden_states_out[4]) # Bottleneck output
+        # --- Classification Pathway ---
+        class_features = self.classification_gap(dec4) # Apply GAP: (B, C, 1, 1, 1)
+        class_features = torch.flatten(class_features, 1) # Flatten: (B, C)
+        classification_logits = self.classification_head(class_features) # Get logits: (B, 1)
+
+        # --- Segmentation Pathway (continues as before) ---
+        dec3 = self.decoder5(dec4, hidden_states_out[3])
         dec3 = self.decoder5(dec4, hidden_states_out[3])
         dec2 = self.decoder4(dec3, enc3)
         dec1 = self.decoder3(dec2, enc2)
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
+
+        segmentation_logits = self.final_out(out) # Assuming 'out' is the final decoder output before this
+
         
         # Apply skip connections from initial encoders
         out = self.final_out(out) 
@@ -302,11 +325,10 @@ class SwinUNETR(nn.Module):
             ds3_logits = self.ds_3(dec2) # Output from stage fed into decoder3
             ds4_logits = self.ds_4(dec3) # Output from stage fed into decoder4 (decoder5 output)
             
-            # Return in order: [main_logits, ds1, ds2, ds3, ds4]
-            # Order should align with deep_supervision_weights in train.py (typically high-res first)
-            return [out, ds1_logits, ds2_logits, ds3_logits, ds4_logits]
+            seg_outputs = [segmentation_logits, ds1_logits, ds2_logits, ds3_logits, ds4_logits]
+            return seg_outputs, classification_logits # Return list for seg, single tensor for class
         else:
-            return out
+            return segmentation_logits, classification_logits # Return two tensors
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

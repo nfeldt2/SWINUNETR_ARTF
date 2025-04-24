@@ -5,6 +5,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable # For colorbar
 import torch
 import time
 import warnings # Added for warnings
+from monai.transforms import Compose as MonaiCompose
+from batchgenerators.dataloading.data_loader import DataLoader as BGDataLoader
 
 try:
     import wandb
@@ -12,85 +14,49 @@ except ImportError:
     print("Warning: wandb not installed. Logging functions may fail.")
     wandb = None
 
-def initialize_wandb(trainer_self, run_identifier: str, continue_tr: bool):
-    """Initializes Weights & Biases logging.
-    
-    Args:
-        trainer_self: The trainer instance (to access config attributes like fold_dir, verbose etc.).
-        run_identifier: A unique identifier for the run (e.g., Dataset_C#_Fold#_LossType).
-        continue_tr: Boolean flag indicating if training is being resumed.
-    """
-    if not trainer_self.verbose: # Check verbose flag from trainer
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Verbose is False, WandB initialization skipped.")
-        trainer_self.wandb_initialized = False
-        return
-        
-    if wandb is None:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WandB not installed, logging disabled.")
-        trainer_self.wandb_initialized = False
+def initialize_wandb(trainer_instance, run_id_suffix, resume_flag, project_name="DefaultProjectName"): # Added project_name
+    """Initializes WandB logging if not disabled and library is available."""
+
+    if not trainer_instance.verbose or getattr(trainer_instance, 'no_wandb', False): # Check if --no_wandb was passed via args
+        print("WandB logging is disabled.")
+        trainer_instance.wandb_initialized = False
         return
 
-    if trainer_self.wandb_initialized: # Avoid re-initializing
-         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WandB already initialized.")
-         return
+    if wandb is None:
+        print("WandB library not found, cannot initialize.")
+        trainer_instance.wandb_initialized = False
+        return
 
     try:
-        # Extract config from trainer instance
-        config = {
-            "batch_size": getattr(trainer_self, 'batch_size', None),
-            "patch_size": getattr(trainer_self, 'default_patch_size', None),
-            "img_size": getattr(trainer_self, 'img_size', None),
-            "feature_size": getattr(trainer_self, 'feature_size', None),
-            "max_epochs": getattr(trainer_self, 'num_epochs', None),
-            "initial_lr": getattr(trainer_self, 'initial_lr', None),
-            "min_lr": getattr(trainer_self, 'min_lr', None),
-            "weight_decay": getattr(trainer_self, 'weight_decay', None),
-            "warmup_epochs": getattr(trainer_self, 'warmup_epochs', None),
-            "scheduler_T0": getattr(trainer_self, 'T_0', None),
-            "scheduler_T_mult": getattr(trainer_self, 'T_mult', None),
-            "fold": getattr(trainer_self, 'fold', None),
-            "model": "SwinUNETR-artf-binary", 
-            "dataset": run_identifier.split('_Fold')[0], # Extract base name before Fold
-            "target_class": getattr(trainer_self, 'target_class', None),
-            "deep_supervision": getattr(trainer_self, 'enable_deep_supervision', None),
-            "use_roi": getattr(trainer_self, 'use_roi', None),
-            "loss_type": getattr(trainer_self, 'loss_type', None),
-            "foreground_prob": getattr(trainer_self, 'foreground_prob', None),
-            "lambda_dice": getattr(trainer_self, 'lambda_dice', None),
-            "lambda_ce": getattr(trainer_self, 'lambda_ce', None),
-            # Add other relevant hyperparameters if needed
-        }
-        # Use the provided identifier for name and id
-        run_name = run_identifier
-        # Determine resume behavior based on continue_tr
-        resume_status = "allow" if continue_tr else None
-        run_id = run_identifier if continue_tr else None # Only provide ID if resuming
-        
-        if wandb.run is None: # Check if a run is already active
-             # Ensure fold_dir exists on the trainer object
-             if not hasattr(trainer_self, 'fold_dir') or trainer_self.fold_dir is None:
-                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: fold_dir not set on trainer. Cannot initialize WandB.")
-                 trainer_self.wandb_initialized = False
-                 return
-                 
-             wandb.init(project="swinunetr-artifact-correction", 
-                        config=config, 
-                        dir=str(trainer_self.fold_dir), # Log wandb runs within the fold directory
-                        name=run_name, # Name the run based on the fold
-                        resume=resume_status, # Use determined resume status
-                        id=run_id) # Provide ID only if resuming
-             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WandB initialized successfully for run '{run_name}' (Resuming: {continue_tr})") # Added resume status to log
-             trainer_self.wandb_initialized = True # Set flag on trainer
-        else:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WandB run {wandb.run.id} already active.")
-            trainer_self.wandb_initialized = True # Assume it's initialized if active
-            
-    except ImportError:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WandB not installed, disabling logging.")
-        trainer_self.wandb_initialized = False
+        # Define run name and potentially ID for resuming
+        run_name = f"Fold_{trainer_instance.fold}_{run_id_suffix}"
+        run_id = run_name if resume_flag else None # Use name as ID for resuming specific fold run
+
+        # Get hyperparameters from trainer instance's args (if stored) or directly
+        # This part might need refinement based on how args are stored in your Trainer
+        config_dict = {}
+        if hasattr(trainer_instance, 'args'): # If args were stored directly
+             config_dict = vars(trainer_instance.args)
+        else: # Otherwise, try accessing attributes directly (less robust)
+             config_dict = {k: v for k, v in trainer_instance.__dict__.items()
+                            if not k.startswith('_') and not isinstance(v, (torch.nn.Module, torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler, MonaiCompose, BGDataLoader))} # Basic filtering
+
+        # --- Use the project_name parameter ---
+        wandb.init(
+            project=project_name, # <<< Use the passed argument here
+            config=config_dict,
+            name=run_name,
+            dir=str(trainer_instance.fold_dir), # Ensure wandb files go into fold dir
+            id=run_id, # If resuming, wandb uses this ID
+            resume="allow" if resume_flag else None # Allow resuming if ID matches
+        )
+
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WandB initialized successfully for run '{run_name}' (Resuming: {resume_flag})")
+        trainer_instance.wandb_initialized = True
+
     except Exception as e:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error initializing wandb: {e}. Disabling logging.")
-        trainer_self.wandb_initialized = False
+        print(f"Error initializing WandB: {e}")
+        trainer_instance.wandb_initialized = False
 
 def save_debug_images(fold_dir: Path, epoch: int, step: int, image_tensor: torch.Tensor, 
                         output_c1: torch.Tensor, target_c1: torch.Tensor, 

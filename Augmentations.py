@@ -12,16 +12,16 @@ def get_augmentations():
         patch_center_dist_from_border=None,
         do_elastic_deform=False,
         do_rotation=True,
-        angle_x=(-10 / 360. * 2 * np.pi, 10 / 360. * 2 * np.pi),
-        angle_y=(-10 / 360. * 2 * np.pi, 10 / 360. * 2 * np.pi),
-        angle_z=(-10 / 360. * 2 * np.pi, 10 / 360. * 2 * np.pi),
+        angle_x=(-20 / 360. * 2 * np.pi, 20 / 360. * 2 * np.pi),
+        angle_y=(-20 / 360. * 2 * np.pi, 20 / 360. * 2 * np.pi),
+        angle_z=(-20 / 360. * 2 * np.pi, 20 / 360. * 2 * np.pi),
         scale=(0.75, 1.25),
         border_mode_data='constant',
         border_cval_data=0,
         border_mode_seg='constant',
         border_cval_seg=0,
         order_seg=0,
-        order_data=3,
+        order_data=1,
         do_scale=True,
         random_crop=False,
         p_rot_per_sample=0.2,
@@ -47,7 +47,7 @@ def get_augmentations():
         per_channel=False,
         p_per_channel=0.5,
         order_downsample=0,
-        order_upsample=3,
+        order_upsample=1,
         p_per_sample=0.25,
         channels=[0]
     )
@@ -57,11 +57,10 @@ def get_augmentations():
         spatial_transform,
         gaussian_noise,
         gaussian_blur,
-        # brightness_multiplicative,
-        # contrast_augmentation,
-        # low_resolution_simulation,
-        # gamma_transform_retain_stats,
-        # gamma_transform
+        brightness_multiplicative,
+        contrast_augmentation,
+        gamma_transform_retain_stats,
+        gamma_transform
     ]
     
     transforms = Compose(all_transforms)
