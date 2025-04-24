@@ -174,21 +174,25 @@ class MaskedDiceLoss(nn.Module):
         self.eps = eps
 
     def forward(self, seg_logits: torch.Tensor, seg_targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute masked Dice loss per image: for each image, average Dice over present classes,
+        then average across images.
+        """
         # seg_logits: [B, C, D, H, W], seg_targets: [B, D, H, W]
         probs = F.softmax(seg_logits, dim=1)  # [B, C, D, H, W]
         gt_onehot = one_hot(seg_targets, num_classes=self.num_classes)  # [B, C, D, H, W]
         losses = []
         B = seg_logits.shape[0]
-        # compute per-sample, per-class dice
-        for c in range(self.num_classes):
-            if c == 0 and self.ignore_background:
-                continue
-            for b in range(B):
-                gt_c = gt_onehot[b, c, ...].float()
-                if gt_c.sum() > 0:
-                    pred_c = probs[b, c, ...]
-                    inter = (pred_c * gt_c).sum()
-                    denom = pred_c.sum() + gt_c.sum()
+        for b in range(B):
+            for c in range(self.num_classes):
+                if c == 0 and self.ignore_background:
+                    continue
+                gt_b_c = gt_onehot[b, c, ...].float()
+                # only compute Dice if class present in this image
+                if gt_b_c.sum() > 0:
+                    pred_b_c = probs[b, c, ...]
+                    inter = (pred_b_c * gt_b_c).sum()
+                    denom = pred_b_c.sum() + gt_b_c.sum()
                     dice_c = 1.0 - 2.0 * inter / (denom + self.eps)
                     losses.append(dice_c)
         if losses:
@@ -874,6 +878,11 @@ def main(args):
         scale = 5.0
         class_weight = 0.2 * (1.0 + math.tanh((epoch - mid_epoch) / scale))
         print(f"Classification loss weight: {class_weight:.3f} at epoch {epoch}")
+        # compute dynamic dice weight ramping from 1 → args.lambda_ce
+        mid_dice = args.epochs / 2.0
+        scale_dice = args.epochs / 4.0
+        dice_weight = 1.0 + (args.lambda_ce - 1.0) * 0.5 * (1.0 + math.tanh((epoch - mid_dice) / scale_dice))
+        print(f"Dynamic dice weight: {dice_weight:.3f} at epoch {epoch}")
         for batch_data in progress_bar:
             # Expecting 'data', 'seg', 'label' (label might be ignored)
             if not isinstance(batch_data, dict) or 'data' not in batch_data or 'seg' not in batch_data or batch_data['data'].size == 0:
@@ -924,7 +933,7 @@ def main(args):
             try: # Backward pass
                 loss = criterion(seg_logits, seg_targets) # Use MaskedDiceLoss
                 seg_ce_loss = seg_ce_criterion(seg_logits, seg_targets.squeeze(1))  # Use CrossEntropyLoss
-                loss = args.lambda_dice * loss + args.lambda_ce * seg_ce_loss + class_weight * (class_loss + class_weight * class_probs_loss)
+                loss = dice_weight * loss + args.lambda_ce * seg_ce_loss + class_weight * (class_loss + class_weight * class_probs_loss)
                 loss.backward(); optimizer.step()
             except Exception as e: print(f"Backward/step error: {e}"); continue
 
@@ -1119,7 +1128,7 @@ def main(args):
                          # segmentation CE component (squeeze channel dim)
                          seg_ce_loss = seg_ce_criterion(seg_logits, seg_targets.squeeze(1))
                          # combine dice and CE with weights
-                         loss_val = args.lambda_dice * dice_loss + args.lambda_ce * seg_ce_loss
+                         loss_val = dice_weight * dice_loss + args.lambda_ce * seg_ce_loss
                          if class_logits is not None:
                              # classification head CE
                              class_loss = class_criterion(class_logits, class_targets)
@@ -1169,10 +1178,17 @@ def main(args):
                          # Update class accuracy EMAs
                          if class_logits is not None:
                              class_accs = val_accuracy_tracker.update(class_logits, class_targets)
+                             # compute per-class segmentation pixel accuracy
+                             seg_preds = torch.argmax(seg_logits, dim=1)  # [B, D, H, W]
+                             seg_t = seg_targets.squeeze(1)
+                             acc1 = ((seg_preds == 1) & (seg_t == 1)).sum().float() / ((seg_t == 1).sum().float().clamp(min=1))
+                             acc2 = ((seg_preds == 2) & (seg_t == 2)).sum().float() / ((seg_t == 2).sum().float().clamp(min=1))
                              val_pbar.set_postfix(
-                                 loss=f"{loss_val.item():.4f}",
-                                 cls1_acc=f"{class_accs.get(1, 0):.4f}",
-                                 cls2_acc=f"{class_accs.get(2, 0):.4f}"
+                                 val_loss=f"{loss_val.item():.4f}",
+                                 class1_head_acc=f"{class_accs.get(1, 0):.4f}",
+                                 class2_head_acc=f"{class_accs.get(2, 0):.4f}",
+                                 seg1_acc=f"{acc1.item():.4f}",
+                                 seg2_acc=f"{acc2.item():.4f}"
                              )
                              
                              # Store predictions and targets for confusion matrix and classification report
