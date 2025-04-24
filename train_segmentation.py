@@ -191,8 +191,6 @@ class MaskedDiceLoss(nn.Module):
                     denom = pred_c.sum() + gt_c.sum()
                     dice_c = 1.0 - 2.0 * inter / (denom + self.eps)
                     losses.append(dice_c)
-                else:
-                    losses.append(torch.tensor(0.0, device=seg_logits.device))
         if losses:
             return self.lambda_term * torch.stack(losses).mean()
         # no classes to include anywhere
@@ -809,8 +807,7 @@ def main(args):
         num_processes=args.num_workers,
         num_cached_per_queue=2,
         pin_memory=True,
-        useroi=False, # Disable ROI calculation
-        generate_patches=False # Disable patch generation
+        useroi=False # Disable ROI calculation
     )
     print("MultiThreadedAugmenter initialized.")
     log_memory("After MultiThreadedAugmenter Init") # <<< Log Point
@@ -862,7 +859,7 @@ def main(args):
 
         # --- NO RESTART CALL ---
 
-        MAX_STEPS_PER_EPOCH = 1000
+        MAX_STEPS_PER_EPOCH = 500
         # --- End Define ---
 
         # Wrap train_loader with islice and set total for tqdm
@@ -883,8 +880,8 @@ def main(args):
                 continue # Skip incomplete batch
             train_steps += 1
 
-            inputs = batch_data['data'].to(device).float()
-            seg_targets = batch_data['seg'].to(device).long() # Use 'seg', ensure Long
+            inputs = torch.tensor(batch_data['data']).to(device).float()
+            seg_targets = torch.tensor(batch_data['seg']).to(device).long() # Use 'seg', ensure Long
             
             # for each segmentation in the batch, we need to see which ones have class 1 and which ones have class 2
             # if there is none that image has a class target of 0
@@ -1065,8 +1062,8 @@ def main(args):
                     # Validation loader outputs Tensors: {'image', 'seg'} (or maybe 'seg_target' if not changed)
                     if 'image' not in batch_data or 'seg' not in batch_data: continue # Adjust keys based on val_transforms output
 
-                    inputs = batch_data['image'].to(device).float()
-                    seg_targets = batch_data['seg'].to(device).long() # Use 'seg', ensure Long
+                    inputs = torch.tensor(batch_data['data']).to(device).float()
+                    seg_targets = torch.tensor(batch_data['seg']).to(device).long() # Use 'seg', ensure Long
                     
                     # Apply target remapping
                     seg_targets[seg_targets == 4] = 0 # Set class 4 to background
