@@ -74,3 +74,11 @@ Thumbs.db
 *.txt.xz
 *.txt.bz2
 *.txt.lzma
+
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
