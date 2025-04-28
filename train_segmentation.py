@@ -21,7 +21,6 @@ import torch.optim as optim
 # Use MONAI DataLoader for validation
 from monai.data import DataLoader as MonaiDataLoader
 from sklearn.model_selection import KFold # Keep KFold if used for splitting
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix # Can remove later
 from tqdm import tqdm
 
 import torch
@@ -92,205 +91,6 @@ def log_memory(stage: str):
     mem_info = _process.memory_info(); rss_gb = mem_info.rss / (1024**3); vms_gb = mem_info.vms / (1024**3)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S"); print(f"MEMLOG [{timestamp}] - {stage}: RSS={rss_gb:.2f} GB, VMS={vms_gb:.2f} GB")
 
-# --- Exponential Moving Average for Class Accuracy ---
-class ClassAccuracyEMA:
-    """
-    Tracks exponential moving average accuracy for specific classes.
-    """
-    def __init__(self, classes_to_track=[1, 2], alpha=0.95):
-        """
-        Initialize EMA tracker for specific classes.
-        
-        Args:
-            classes_to_track: List of class indices to track (default: [1, 2])
-            alpha: EMA decay factor (default: 0.95, higher means slower updates)
-        """
-        self.classes_to_track = classes_to_track
-        self.alpha = alpha
-        self.class_ema = {cls: 0.0 for cls in classes_to_track}
-        self.class_counts = {cls: 0 for cls in classes_to_track}
-        self.initialized = False
-        
-    def update(self, logits, targets):
-        """
-        Update EMA accuracies based on current batch.
-        
-        Args:
-            logits: Tensor of shape [B, C] with class logits
-            targets: Tensor of shape [B] with class targets
-        
-        Returns:
-            Dict of current EMA accuracies for tracked classes
-        """
-        preds = torch.argmax(logits, dim=1)
-        
-        for cls in self.classes_to_track:
-            # Find samples of this class
-            cls_mask = (targets == cls)
-            cls_count = cls_mask.sum().item()
-            
-            if cls_count > 0:
-                # Calculate accuracy on samples of this class
-                cls_correct = (preds[cls_mask] == targets[cls_mask]).float().mean().item()
-                
-                # Update EMA
-                if not self.initialized and self.class_counts[cls] == 0:
-                    self.class_ema[cls] = cls_correct
-                else:
-                    self.class_ema[cls] = self.alpha * self.class_ema[cls] + (1 - self.alpha) * cls_correct
-                
-                self.class_counts[cls] += cls_count
-        
-        if not self.initialized and all(self.class_counts[cls] > 0 for cls in self.classes_to_track):
-            self.initialized = True
-            
-        return {cls: self.class_ema[cls] for cls in self.classes_to_track}
-    
-    def get_accuracy_string(self):
-        """Return formatted accuracy string for tqdm"""
-        return ", ".join([f"cls{cls}_acc: {self.class_ema[cls]:.4f}" for cls in self.classes_to_track])
-    
-    def reset(self):
-        """Reset all tracked metrics"""
-        self.class_ema = {cls: 0.0 for cls in self.classes_to_track}
-        self.class_counts = {cls: 0 for cls in self.classes_to_track}
-        self.initialized = False
-
-# Define a MaskedDiceLoss class with lambda term and optional background ignore
-class MaskedDiceLoss(nn.Module):
-    """
-    Dice loss averaged over classes, skipping classes without GT voxels.
-    Can ignore background (class 0) and scales by lambda_term.
-    """
-    def __init__(self,
-                 num_classes: int,
-                 lambda_term: float = 1.0,
-                 ignore_background: bool = True,
-                 eps: float = 1e-6):
-        super().__init__()
-        self.num_classes = num_classes
-        self.lambda_term = lambda_term
-        self.ignore_background = ignore_background
-        self.eps = eps
-
-    def forward(self, seg_logits: torch.Tensor, seg_targets: torch.Tensor) -> torch.Tensor:
-        """
-        Compute masked Dice loss per image: for each image, average Dice over present classes,
-        then average across images.
-        """
-        # seg_logits: [B, C, D, H, W], seg_targets: [B, D, H, W]
-        probs = F.softmax(seg_logits, dim=1)  # [B, C, D, H, W]
-        gt_onehot = one_hot(seg_targets, num_classes=self.num_classes)  # [B, C, D, H, W]
-        losses = []
-        B = seg_logits.shape[0]
-        for b in range(B):
-            for c in range(self.num_classes):
-                if c == 0 and self.ignore_background:
-                    continue
-                gt_b_c = gt_onehot[b, c, ...].float()
-                # only compute Dice if class present in this image
-                if gt_b_c.sum() > 0:
-                    pred_b_c = probs[b, c, ...]
-                    inter = (pred_b_c * gt_b_c).sum()
-                    denom = pred_b_c.sum() + gt_b_c.sum()
-                    dice_c = 1.0 - 2.0 * inter / (denom + self.eps)
-                    losses.append(dice_c)
-        if losses:
-            return self.lambda_term * torch.stack(losses).mean()
-        # no classes to include anywhere
-        return torch.tensor(0.0, device=seg_logits.device)
-
-# --- get_image_label (Not strictly needed for seg task, but used by loader) ---
-# CORRECTED VERSION
-def get_image_label(segmentation_mask_data: np.ndarray, min_pixels_threshold: int = 100) -> int:
-    """
-    Derives a single image-level classification label from a segmentation mask,
-    requiring a minimum number of artifact pixels. CORRECTED VERSION.
-    """
-    # Ensure input is numpy array if it's a tensor (might happen if called elsewhere)
-    if isinstance(segmentation_mask_data, torch.Tensor):
-        segmentation_mask_data = segmentation_mask_data.cpu().numpy()
-
-    unique_labels = np.unique(segmentation_mask_data)
-
-    # Check for class 1 first
-    if 1 in unique_labels:
-        count1 = np.count_nonzero(segmentation_mask_data == 1)
-        # Only check the threshold if label 1 exists and count1 is calculated
-        if count1 >= min_pixels_threshold:
-            return 1
-    
-    # Only check for class 2 if class 1 wasn't present or wasn't dominant enough
-    # Note: Changed from elif to if, to correctly handle cases where 1 exists but count1 < threshold
-    if 2 in unique_labels:
-        count2 = np.count_nonzero(segmentation_mask_data == 2)
-        # Only check the threshold if label 2 exists and count2 is calculated
-        if count2 >= min_pixels_threshold:
-            return 2
-
-    # If neither class 1 nor class 2 met the criteria
-    return 0
-
-# --- Visualization Function (Optional) ---
-# def save_small_artifact_visualization(...) -> remains the same if needed
-
-# --- Custom Transform for NPZ Loading (Copied) ---
-class LoadPairedArr0d(MapTransform):
-    """
-    Custom dictionary transform to load image and segmentation data from
-    separate NPZ files specified by 'image_path' and 'seg_path' keys.
-    It assumes the relevant data in both files is stored under the key 'arr_0'.
-    Outputs the loaded arrays under the keys 'image' and 'seg'.
-    """
-    def __init__(self, keys=("image_path", "seg_path"), allow_missing_keys=False):
-        super().__init__(keys, allow_missing_keys)
-
-    def __call__(self, data):
-        d = dict(data)
-        img_path = d.get("image_path")
-        seg_path = d.get("seg_path")
-
-        if img_path is None or seg_path is None:
-            raise KeyError("Input dictionary must contain 'image_path' and 'seg_path' keys.")
-
-        try:
-            img_npz = np.load(img_path)
-            if 'arr_0' not in img_npz:
-                raise KeyError(f"Key 'arr_0' not found in image npz file: {img_path}. Available keys: {list(img_npz.keys())}")
-            d["image"] = img_npz['arr_0']
-            img_npz.close()
-
-            seg_npz = np.load(seg_path)
-            if 'arr_0' not in seg_npz:
-                raise KeyError(f"Key 'arr_0' not found in seg npz file: {seg_path}. Available keys: {list(seg_npz.keys())}")
-            d["seg"] = seg_npz['arr_0']
-            seg_npz.close()
-
-            # Remove original path keys after successful loading
-            del d["image_path"]
-            del d["seg_path"]
-
-        except Exception as e:
-            print(f"Error loading paired NPZ files ({img_path}, {seg_path}): {e}")
-            raise e
-        return d
-    
-# --- GetLabelFromSegd (Only needed if validation transforms require it) ---
-# We might not need this if val transforms are simplified or label isn't used
-class GetLabelFromSegd(MapTransform):
-    def __init__(self, keys: str, label_key: str = 'label', min_pixels_threshold: int = 100, allow_missing_keys: bool = False):
-        super().__init__(keys=[keys] if isinstance(keys, str) else keys, allow_missing_keys=allow_missing_keys)
-        self.seg_input_key = keys; self.label_output_key = label_key; self.min_pixels_threshold = min_pixels_threshold
-    def __call__(self, data):
-        d = dict(data); seg_data = d.get(self.seg_input_key)
-        if seg_data is None:
-            if not self.allow_missing_keys: raise KeyError(f"Seg key '{self.seg_input_key}' missing.")
-            d[self.label_output_key] = 0; return d
-        seg_np = seg_data.cpu().numpy() if isinstance(seg_data, torch.Tensor) else np.asarray(seg_data)
-        image_label = get_image_label(seg_np, self.min_pixels_threshold) # Use global func
-        d[self.label_output_key] = image_label
-        return d
-
 # --- Base Loader Class (Copied *exactly* from classify_artifacts.py) ---
 # This loader's generate_train_batch applies monai_transforms sequentially
 # and returns a dict of NumPy arrays: {'data', 'seg', 'label', ...}
@@ -350,7 +150,6 @@ class ArtifactClassificationDataLoader(DataLoader):
         indices = self.get_indices()
         batch_images = []
         batch_segs = []
-        batch_labels = []
         batch_filenames = []
         skipped_count = 0
 
@@ -370,10 +169,22 @@ class ArtifactClassificationDataLoader(DataLoader):
                     # Keep seg as int/uint8 for label finding, maybe convert later if needed
                     seg_np = seg_npz['arr_0'].astype(np.uint8)
 
+                # Skip volumes containing class 2 by resampling until we get a valid one (maintains batch size)
+                while np.any(seg_np == 2):
+                    data_dict_i = self._data[random.randint(0, len(self._data) - 1)]
+                    img_path_str = data_dict_i.get('image_path', 'unknown_image')
+                    seg_path_str = data_dict_i.get('seg_path', 'unknown_seg')
+                    filename = Path(img_path_str).name
+                    # Reload image and segmentation
+                    with np.load(img_path_str) as img_npz:
+                        if 'arr_0' not in img_npz: raise KeyError("arr_0 not in image")
+                        image_np = img_npz['arr_0'].astype(np.float32)
+                    with np.load(seg_path_str) as seg_npz:
+                        if 'arr_0' not in seg_npz: raise KeyError("arr_0 not in seg")
+                        seg_np = seg_npz['arr_0'].astype(np.uint8)
+
                 seg_np[seg_np == 4] = 0
                 seg_np[seg_np == 3] = 0
-
-
                 # 2. Manual EnsureChannelFirst (Assuming DHW input -> CDHW)
                 if image_np.ndim == 3: image_np = image_np[None, ...] # Add channel dim
                 if seg_np.ndim == 3: seg_np = seg_np[None, ...]       # Add channel dim
@@ -435,17 +246,12 @@ class ArtifactClassificationDataLoader(DataLoader):
                 # 6. Manual Normalize Intensity
                 img_normalized = (img_resized - self.norm_subtrahend) / self.norm_divisor
 
-                # 7. Get Label (from final processed segmentation)
-                seg_np_final = seg_resized.cpu().numpy() # Convert final seg to numpy
-                image_label = get_image_label(seg_np_final[0], self.min_pixels_threshold) # Pass spatial part
-
-                # 8. Convert final image tensor to NumPy for batchgenerators
+                # 7. Convert final image tensor to NumPy for batchgenerators
                 image_np_final = img_normalized.cpu().numpy()
 
                 # --- Append results ---
                 batch_images.append(image_np_final)
-                batch_segs.append(seg_np_final) # Append final processed seg
-                batch_labels.append(image_label)
+                batch_segs.append(seg_resized.cpu().numpy()) # Append final processed seg
                 batch_filenames.append(filename)
 
             except FileNotFoundError as e:
@@ -470,8 +276,6 @@ class ArtifactClassificationDataLoader(DataLoader):
             return {
                 'data': np.empty((0, c, d, h, w), dtype=np.float32),
                 'seg': np.empty((0, c, d, h, w), dtype=np.uint8), # Match output type
-                'label': np.empty((0,), dtype=np.int64),
-                'filenames': [],
                 'roi': np.empty((0, c, d, h, w), dtype=np.int64)
              }
 
@@ -479,7 +283,6 @@ class ArtifactClassificationDataLoader(DataLoader):
             image_batch_np = np.stack(batch_images, axis=0)
             # Ensure seg batch matches expected type (e.g., uint8)
             seg_batch_np = np.stack(batch_segs, axis=0).astype(np.uint8)
-            label_batch_np = np.array(batch_labels, dtype=np.int64)
         except Exception as stack_e:
             tqdm.write(f"Error stacking batch data: {stack_e}")
             tqdm.write(f"Individual image shapes: {[img.shape for img in batch_images]}")
@@ -489,8 +292,6 @@ class ArtifactClassificationDataLoader(DataLoader):
             return {
                 'data': np.empty((0, c, d, h, w), dtype=np.float32),
                 'seg': np.empty((0, c, d, h, w), dtype=np.uint8),
-                'label': np.empty((0,), dtype=np.int64),
-                'filenames': [],
                 'roi': np.empty((0, c, d, h, w), dtype=np.int64)
              }
 
@@ -498,10 +299,39 @@ class ArtifactClassificationDataLoader(DataLoader):
         return {
             'data': image_batch_np,
             'seg': seg_batch_np,
-            'label': label_batch_np,
             'roi': np.ones_like(seg_batch_np, dtype=np.int64), # Keep ROI for compatibility maybe?
             'filenames': batch_filenames
         }
+
+# --- Custom Transform for NPZ Loading (Copied) ---
+class LoadPairedArr0d(MapTransform):
+    """
+    Custom transform to load image and segmentation from separate NPZ files under keys 'arr_0'.
+    Outputs arrays under 'image' and 'seg'.
+    """
+    def __init__(self, keys=("image_path", "seg_path"), allow_missing_keys=False):
+        super().__init__(keys, allow_missing_keys)
+
+    def __call__(self, data):
+        d = dict(data)
+        img_path = d.get("image_path")
+        seg_path = d.get("seg_path")
+        if img_path is None or seg_path is None:
+            raise KeyError("Input must contain 'image_path' and 'seg_path'.")
+        try:
+            img_npz = np.load(img_path)
+            if 'arr_0' not in img_npz:
+                raise KeyError(f"'arr_0' missing in image {img_path}")
+            d['image'] = img_npz['arr_0']; img_npz.close()
+            seg_npz = np.load(seg_path)
+            if 'arr_0' not in seg_npz:
+                raise KeyError(f"'arr_0' missing in seg {seg_path}")
+            d['seg'] = seg_npz['arr_0']; seg_npz.close()
+            del d['image_path']; del d['seg_path']
+        except Exception as e:
+            print(f"Error loading NPZ: {e}")
+            raise e
+        return d
 
 def checkpoint(run_output_dir, device, model, optimizer, scheduler):
     # --- Checkpoint Loading (Similar, track Dice) ---
@@ -522,13 +352,13 @@ def checkpoint(run_output_dir, device, model, optimizer, scheduler):
     return model, optimizer, scheduler, start_epoch, best_metric, best_metric_epoch
 
 def initialize_model(args, device, run_output_dir):
+    # Build model with segmentation head only (num_classification_outputs defaults to 1)
     model = SwinUNETR(
         img_size=args.input_size,
         in_channels=1,
         out_channels=args.num_seg_classes,
         feature_size=args.feature_size,
         use_v2=True,
-        num_classification_outputs=3,
     ).to(device)
     
     # Simple print of model initialization
@@ -539,12 +369,18 @@ def initialize_model(args, device, run_output_dir):
     elif args.optimizer.lower() == 'sgd': optimizer = optim.SGD(model.parameters(), lr=args.initial_lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
     else: raise ValueError(f"Unsupported optimizer: {args.optimizer}")
     print(f"Using {args.optimizer} optimizer: LR={args.initial_lr}, WD={args.weight_decay}")
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=args.scheduler_T0,
+        T_mult=args.scheduler_T_mult,
+        eta_min=args.min_lr
+    )
     model, optimizer, scheduler, start_epoch, best_metric, best_metric_epoch = checkpoint(run_output_dir, device, model, optimizer, scheduler)
     
     if not start_epoch:
         start_epoch = 0
-        best_metric = 0.0
+        # initialize best_metric high for validation loss minimization
+        best_metric = float('inf')
         best_metric_epoch = -1
     else:
         print(f"Resumed from Epoch {start_epoch}. Previous best Dice: {best_metric:.4f}")
@@ -558,7 +394,10 @@ def main(args):
     log_memory("Main Start") # <<< Log Point 1
     set_determinism(seed=args.seed)
     output_dir = Path(args.output_dir)
-    run_name = f"run_ep{args.epochs}_bs{args.batch_size}_lr{args.initial_lr}_optim{args.optimizer}"
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        run_name = f"run_ep{args.epochs}_bs{args.batch_size}_lr{args.initial_lr}_optim{args.optimizer}"
     run_output_dir = output_dir / run_name
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -835,15 +674,10 @@ def main(args):
     print(f"Using device: {device}")
     print(f"Initializing SwinUNETR for {args.num_seg_classes} segmentation classes.")
     
-    # --- Loss and Optimizer (CHANGED for Segmentation) ---
-    print(f"Using MaskedDiceLoss for {args.num_seg_classes} classes.")
-    # instantiate masked dice loss module (ignore background by default)
-    criterion = MaskedDiceLoss(num_classes=args.num_seg_classes,
-                               lambda_term=1.0,
-                               ignore_background=True)
-    criterion = criterion.to(device)
-    seg_ce_criterion = nn.CrossEntropyLoss()
-    class_criterion = nn.CrossEntropyLoss()
+    # --- Loss and Optimizer (CHANGED for Binary Segmentation) ---
+    print(f"Using DiceCELoss with lambda_dice={args.lambda_dice}, lambda_ce={args.lambda_ce}")
+    # DiceCELoss = Dice + lambda_ce * CrossEntropy; scale entire loss by lambda_dice
+    criterion = DiceCELoss(to_onehot_y=False, sigmoid=True, lambda_ce=args.lambda_ce).to(device)
 
     # --- Metrics ---
     dice_metric = DiceMetric(include_background=True, reduction="mean_batch", get_not_nans=False)
@@ -851,20 +685,20 @@ def main(args):
     print(f"Starting segmentation training for {args.epochs} epochs...")
     model, optimizer, scheduler, start_epoch, best_metric, best_metric_epoch = initialize_model(args, device, run_output_dir)
     
-    # --- Training Loop (ADAPTED for Segmentation) ---
+    # --- Training Loop (ADAPTED for Single-Class Segmentation) ---
     for epoch in range(start_epoch, args.epochs):
         log_memory(f"Epoch {epoch} Start")
         model.train(); train_loss = 0.0; train_steps = 0
         epoch_start_time = time.time(); print("-" * 10); print(f"Epoch {epoch}/{args.epochs - 1}")
         recent_train_losses = []
-        
-        # Initialize class accuracy tracker for this epoch
-        train_accuracy_tracker = ClassAccuracyEMA(classes_to_track=[1, 2], alpha=0.98)
-
-        # --- NO RESTART CALL ---
-
-        MAX_STEPS_PER_EPOCH = 500
-        # --- End Define ---
+        MAX_STEPS_PER_EPOCH = 1000  # cap training steps per epoch
+        # update foreground cropping probability via tanh, plateau at 0.5 by epoch 25
+        mid_pf = 25.0
+        scale_pf = 5.0
+        new_pos = 0.5 + 0.5 * math.tanh((mid_pf - epoch) / scale_pf)
+        # clamp probability to [0.5, 1.0]
+        train_dl.pos_fraction = float(min(1.0, max(0.5, new_pos)))
+        print(f"Foreground sampling prob set to: {train_dl.pos_fraction:.3f}")
 
         # Wrap train_loader with islice and set total for tqdm
         progress_bar = tqdm(
@@ -873,29 +707,6 @@ def main(args):
             leave=False, total=MAX_STEPS_PER_EPOCH,
             dynamic_ncols=True
         )
-        # compute dynamic classification weight (shifted tanh ramp, mid at epoch 5)
-        mid_epoch = 5.0
-        scale = 5.0
-        class_weight = 0.2 * (1.0 + math.tanh((epoch - mid_epoch) / scale))
-        print(f"Classification loss weight: {class_weight:.3f} at epoch {epoch}")
-        # compute dynamic dice weight ramping from 1 → args.lambda_ce
-        mid_dice = args.epochs / 2.0
-        scale_dice = args.epochs / 4.0
-        dice_weight = 1.0 + (args.lambda_ce - 1.0) * 0.5 * (1.0 + math.tanh((epoch - mid_dice) / scale_dice))
-        print(f"Dynamic dice weight: {dice_weight:.3f} at epoch {epoch}")
-        # dynamic foreground sampling prob ramp from args.foreground_prob to 0.40
-        init_fore = args.foreground_prob
-        target_fore = 0.40
-        # reuse the dice mid/scale for foreground ramp
-        fore_ramp = target_fore + (init_fore - target_fore) * (
-            1 - 0.5 * (1.0 + math.tanh((epoch - mid_dice) / scale_dice))
-        )
-        # update manual loader if present
-        try:
-            train_dl.pos_fraction = float(fore_ramp)
-            print(f"Foreground sampling prob set to: {train_dl.pos_fraction:.3f}")
-        except Exception:
-            pass
         for batch_data in progress_bar:
             # Expecting 'data', 'seg', 'label' (label might be ignored)
             if not isinstance(batch_data, dict) or 'data' not in batch_data or 'seg' not in batch_data or batch_data['data'].size == 0:
@@ -904,121 +715,81 @@ def main(args):
             train_steps += 1
 
             inputs = torch.tensor(batch_data['data']).to(device).float()
-            seg_targets = torch.tensor(batch_data['seg']).to(device).long() # Use 'seg', ensure Long
+            seg_targets = torch.tensor(batch_data['seg']).to(device).long() # shape [B,1,D,H,W]
             
-            # for each segmentation in the batch, we need to see which ones have class 1 and which ones have class 2
-            # if there is none that image has a class target of 0
-            class_targets = torch.zeros(seg_targets.shape[0]).to(device)
-            for i in range(seg_targets.shape[0]):
-                if torch.any(seg_targets[i] == 1):
-                    class_targets[i] = 1
-                elif torch.any(seg_targets[i] == 2):
-                    class_targets[i] = 2
-            class_targets = class_targets.long()
-
-
-
             optimizer.zero_grad()
-            try: # Forward pass
+            try:
                 outputs = model(inputs)
-                # Handle potential tuple output from multi-task model
-                seg_logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                class_logits = outputs[1] if isinstance(outputs, tuple) else None
-                # derive aggregated logits for classes 1 and 2 (ignore background channel)
-                logits_12 = seg_logits[:, 1:3, ...]  # shape [B,2,D,H,W]
-                logits_12 = torch.nn.functional.softmax(logits_12, dim=1)
-                vol_logits = logits_12.sum(dim=(2,3,4))  # shape [B,2]
-                # convert summed logits to probabilities for stable classification loss
-                vol_probs = torch.softmax(vol_logits, dim=1)  # shape [B,2]
-            except Exception as e: print(f"Forward pass error: {e}"); continue
+                seg_logits = outputs[0] if isinstance(outputs, tuple) else outputs  # [B,1,D,H,W]
+            except Exception as e:
+                print(f"Forward pass error: {e}")
+                continue
 
             try:
-                class_loss = class_criterion(class_logits, class_targets)
-                # seg-derived classification loss (artifact 1 vs 2)
-                mask = class_targets > 0
-                if mask.any():
-                    seg_bin_targets = (class_targets[mask] == 2).long()
-                    class_probs_loss = F.nll_loss(torch.log(class_targets[mask]), seg_bin_targets)
-                else:
-                    class_probs_loss = torch.tensor(0.0, device=device)
-            except Exception as e: print(f"Class loss calculation error: {e}"); continue
-
-            try: # Backward pass
-                loss = criterion(seg_logits, seg_targets) # Use MaskedDiceLoss
-                seg_ce_loss = seg_ce_criterion(seg_logits, seg_targets.squeeze(1))  # Use CrossEntropyLoss
-                loss = dice_weight * loss + args.lambda_ce * seg_ce_loss + class_weight * (class_loss + class_weight * class_probs_loss)
-                loss.backward(); optimizer.step()
-            except Exception as e: print(f"Backward/step error: {e}"); continue
+                # compute combined Dice+CE loss; seg_targets has shape [B,1,D,H,W]
+                loss = args.lambda_dice * criterion(seg_logits, seg_targets)
+                loss.backward()
+                optimizer.step()
+            except Exception as e:
+                print(f"Loss/backward error: {e}")
+                continue
 
             current_loss = loss.item(); train_loss += current_loss
             recent_train_losses.append(current_loss)
             if len(recent_train_losses) > 100: recent_train_losses.pop(0) # Keep last 100
             avg_recent_loss = np.mean(recent_train_losses)
             
-            # Update class accuracy EMAs
-            if class_logits is not None:
-                try:
-                    class_accs = train_accuracy_tracker.update(class_logits, class_targets)
-                    # display a comprehensive set of metrics
-                    progress_bar.set_postfix(
-                        total_loss=f"{avg_recent_loss:.4f}",
-                        class_loss=f"{class_loss.item():.4f}",
-                        segderived_loss=f"{seg_ce_loss.item():.4f}",
-                        cls1_acc=f"{class_accs.get(1, 0):.4f}",
-                        cls2_acc=f"{class_accs.get(2, 0):.4f}",
-                        loss_weight=f"{class_weight:.3f}",
-                        lr=f"{scheduler.get_last_lr()[0]:.6f}"
-                    )
-                except Exception as e:
-                    print(f"Error updating class accuracies: {e}")
-                    progress_bar.set_postfix(loss=f"{avg_recent_loss:.4f}")
-            else:
-                progress_bar.set_postfix(loss=f"{avg_recent_loss:.4f}")
+            # update progress display with current loss and learning rate
+            progress_bar.set_postfix(
+                loss=f"{avg_recent_loss:.4f}",
+                lr=f"{scheduler.get_last_lr()[0]:.6f}"
+            )
 
-            # Insert debugging visualization every 10 batches
-            if train_steps % 10 == 0:
+            # Insert debugging visualization every 10 batches, drop class2 and slice along y-axis
+            if False and train_steps % 10 == 0:
                 try:
                     import matplotlib.pyplot as plt
-                    # compute segmentation predictions
-                    seg_preds = torch.argmax(seg_logits, dim=1)  # shape [B, D, H, W]
+                    # compute segmentation probabilities and binary mask for class1
+                    pred_prob = torch.sigmoid(seg_logits)  # [B,1,D,H,W]
                     # select first sample
-                    img_vol = inputs[0, 0].cpu().numpy()    # [D, H, W]
-                    pred_vol = seg_preds[0].cpu().numpy()    # [D, H, W]
-                    true_vol = seg_targets.squeeze(1)[0].cpu().numpy()  # [D, H, W]
-                    # define dice calculation
-                    def dice_score(pred, true, cls):
-                        pred_mask = (pred == cls).astype(np.uint8)
-                        true_mask = (true == cls).astype(np.uint8)
+                    img_vol = inputs[0, 0].detach().cpu().numpy()      # [D, H, W]
+                    prob_vol = pred_prob[0, 0].detach().cpu().numpy()       # [D, H, W]
+                    true_vol = seg_targets[0, 0].detach().cpu().numpy()     # [D, H, W]
+                    pred_bin = (prob_vol >= 0.5).astype(np.uint8)
+                    # compute Dice between binary pred and true mask
+                    def dice_score(pred_mask, true_mask):
                         inter = (pred_mask & true_mask).sum()
                         denom = pred_mask.sum() + true_mask.sum()
                         return (2. * inter / denom) if denom > 0 else 1.0
-                    # compute dice for classes 1 and 2
-                    dice1 = dice_score(pred_vol, true_vol, 1)
-                    dice2 = dice_score(pred_vol, true_vol, 2)
-                    # choose slice with most target pixels (classes 1 or 2)
-                    pixel_counts = (true_vol > 0).sum(axis=(1,2))
+                    dice1 = dice_score(pred_bin, (true_vol == 1).astype(np.uint8))
+                    # choose y-axis slice (axis -2) with most targets
+                    pixel_counts = (true_vol > 0).sum(axis=(0,2))
                     if pixel_counts.sum() > 0:
                         slice_idx = int(pixel_counts.argmax())
                     else:
-                        slice_idx = img_vol.shape[0] // 2
-                    img_slice = img_vol[slice_idx]
-                    true_slice = true_vol[slice_idx]
-                    pred1_slice = (pred_vol == 1)[slice_idx]
-                    pred2_slice = (pred_vol == 2)[slice_idx]
-                    # plot with overlay
-                    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                        slice_idx = img_vol.shape[1] // 2
+                    # extract plane along y-axis (D x W)
+                    img_slice = img_vol[:, slice_idx, :]
+                    true_slice = (true_vol == 1)[:, slice_idx, :]
+                    pred_slice = pred_bin[:, slice_idx, :]
+                    # plot with axes labels
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                     # raw input
-                    axes[0].imshow(img_slice, cmap='gray'); axes[0].set_title('Input')
-                    # overlay true segmentation mask per class (red = class1, blue = class2)
-                    axes[1].imshow(img_slice, cmap='gray')
-                    axes[1].imshow(true_slice == 1, cmap='Reds', alpha=0.5)
-                    axes[1].imshow(true_slice == 2, cmap='Blues', alpha=0.5)
-                    axes[1].set_title('True Mask (red=1, blue=2)')
+                    axes[0].imshow(img_slice, cmap='gray', origin='lower')
+                    axes[0].set_title('Input (Y-slice)')
+                    axes[0].set_ylabel('Depth (Z)')
+                    axes[0].set_xlabel('Width (X)')
+                    # overlay true mask class1
+                    axes[1].imshow(img_slice, cmap='gray', origin='lower')
+                    axes[1].imshow(true_slice == 1, cmap='Reds', alpha=0.5, origin='lower')
+                    axes[1].set_title('True Mask (class1)')
+                    axes[1].set_ylabel('Depth (Z)')
+                    axes[1].set_xlabel('Width (X)')
                     # predicted class1 mask
-                    axes[2].imshow(pred1_slice, cmap='Reds'); axes[2].set_title(f'Pred Class1 (dice {dice1:.3f})')
-                    # predicted class2 mask
-                    axes[3].imshow(pred2_slice, cmap='Blues'); axes[3].set_title(f'Pred Class2 (dice {dice2:.3f})')
-                    for ax in axes: ax.axis('off')
+                    axes[2].imshow(pred_slice, cmap='Reds', origin='lower', alpha=0.5)
+                    axes[2].set_title(f'Pred Class1 (dice {dice1:.3f})')
+                    axes[2].set_ylabel('Depth (Z)')
+                    axes[2].set_xlabel('Width (X)')
                     fig.suptitle(f'Epoch {epoch} Batch {train_steps}')
                     # save figure
                     debug_dir = run_output_dir / 'debug_vis'
@@ -1032,11 +803,6 @@ def main(args):
             # Optional: Log step loss to WandB
             if wandb_enabled and train_steps % args.log_freq == 0:
                  wandb_data = {"train/step_loss": current_loss, "train/step_loss_avg100": avg_recent_loss}
-                 # Add class accuracies if available
-                 if class_logits is not None:
-                     for cls in [1, 2]:
-                         if cls in train_accuracy_tracker.class_ema:
-                             wandb_data[f"train/cls{cls}_acc_ema"] = train_accuracy_tracker.class_ema[cls]
                  wandb.log(wandb_data, step=epoch * MAX_STEPS_PER_EPOCH + train_steps)
 
         # End of Epoch Summary
@@ -1044,15 +810,6 @@ def main(args):
         epoch_duration = time.time() - epoch_start_time
         print(f"\n--- Epoch {epoch} Training Summary ---")
         print(f"Avg Train Loss: {avg_train_loss:.4f}, Duration: {epoch_duration:.2f}s")
-        print(f"Class EMA Accuracies: {train_accuracy_tracker.get_accuracy_string()}")
-        
-        if wandb_enabled: 
-            wandb_data = {"train/epoch_loss": avg_train_loss, "epoch": epoch}
-            # Add final EMAs to wandb
-            for cls in [1, 2]:
-                if cls in train_accuracy_tracker.class_ema:
-                    wandb_data[f"train/epoch_cls{cls}_acc_ema"] = train_accuracy_tracker.class_ema[cls]
-            wandb.log(wandb_data, step=(epoch+1)*MAX_STEPS_PER_EPOCH -1)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -1063,13 +820,6 @@ def main(args):
         val_loss = 0.0; val_steps = 0
         dice_metric.reset()
         
-        # Initialize class accuracy tracker for validation
-        val_accuracy_tracker = ClassAccuracyEMA(classes_to_track=[1, 2], alpha=0.95)
-        
-        # Collectors for comprehensive evaluation
-        all_class_preds = []
-        all_class_targets = []
-
         if test_loader:
             log_memory(f"Epoch {epoch} Val Start")
             print(f"Running Validation for Epoch {epoch}...")
@@ -1088,33 +838,13 @@ def main(args):
                         continue # Adjust keys based on val_transforms output
 
                     inputs = torch.tensor(batch_data['image']).to(device).float()
-                    seg_targets = torch.tensor(batch_data['seg']).to(device).long() # Use 'seg', ensure Long
-                    
-                    # Apply target remapping
-                    seg_targets[seg_targets == 4] = 0 # Set class 4 to background
-                    seg_targets[seg_targets == 3] = 0 # Set class 3 to background
-                    
-                    # Derive class targets from segmentation masks
-                    class_targets = torch.zeros(seg_targets.shape[0]).to(device)
-                    for i in range(seg_targets.shape[0]):
-                        if torch.any(seg_targets[i] == 1):
-                            class_targets[i] = 1
-                        elif torch.any(seg_targets[i] == 2):
-                            class_targets[i] = 2
-                    class_targets = class_targets.long()
+                    seg_targets = torch.tensor(batch_data['seg']).to(device).long() # shape [B,1,D,H,W]
                     
                     val_steps += 1
 
                     try:
-                        # Get classification predictions (direct forward pass)
-                        output_tuple = model(inputs)
-                        class_logits = output_tuple[1] if isinstance(output_tuple, tuple) else None
-                        seg_logits = output_tuple[0] if isinstance(output_tuple, tuple) else output_tuple
-                        # derive aggregated probabilities for classes 1 and 2 (ignore background)
-                        logits_12 = seg_logits[:, 1:3, ...]     # shape [B,2,D,H,W]
-                        vol_logits = logits_12.sum(dim=(2,3,4))  # shape [B,2]
-                        vol_probs = torch.softmax(vol_logits, dim=1)  # shape [B,2]
-                        class_probs = vol_probs                  # rename for consistency
+                        outputs = model(inputs)
+                        seg_logits = outputs[0] if isinstance(outputs, tuple) else outputs  # [B,1,D,H,W]
                         
                         # Simple debug to check dimensions
                         if val_steps < 3 or val_steps % 50 == 0:
@@ -1124,92 +854,32 @@ def main(args):
                             if isinstance(seg_logits, torch.Tensor) and seg_logits.dim() > 1:
                                 num_channels = seg_logits.shape[1]
                                 print(f"Seg logits have {num_channels} channels")
-                                for c in range(min(num_channels, args.num_seg_classes)):
+                                for c in range(min(num_channels, 1)):
                                     channel = seg_logits[:, c]
                                     print(f"  Class {c} logits: min={channel.min().item():.4f}, max={channel.max().item():.4f}, mean={channel.mean().item():.4f}")
                                 
-                                # Apply softmax and check probabilities
-                                probs = torch.nn.functional.softmax(seg_logits, dim=1)
-                                for c in range(min(probs.shape[1], args.num_seg_classes)):
-                                    channel = probs[:, c]
-                                    print(f"  Class {c} probs: min={channel.min().item():.4f}, max={channel.max().item():.4f}, mean={channel.mean().item():.4f}")
+                                # compute probabilities with sigmoid for binary segmentation
+                                probs = torch.sigmoid(seg_logits)
+                                channel = probs[:, 0]
+                                print(f"  Class 0 probs: min={channel.min().item():.4f}, max={channel.max().item():.4f}, mean={channel.mean().item():.4f}")
                     except Exception as e: print(f"Validation inference error: {e}"); continue
 
                     try:  # Validation Loss (match training loss formula)
-                         # dice component
-                         dice_loss = criterion(seg_logits, seg_targets)
-                         # segmentation CE component (squeeze channel dim)
-                         seg_ce_loss = seg_ce_criterion(seg_logits, seg_targets.squeeze(1))
-                         # combine dice and CE with weights
-                         loss_val = dice_weight * dice_loss + args.lambda_ce * seg_ce_loss
-                         if class_logits is not None:
-                             # classification head CE
-                             class_loss = class_criterion(class_logits, class_targets)
-                             # seg-derived classification CE
-                             mask = class_targets > 0
-                             if mask.any():
-                                 seg_bin_targets = (class_targets[mask] == 2).long()
-                                 class_probs_loss = F.nll_loss(torch.log(class_probs[mask]), seg_bin_targets)
-                             else:
-                                 class_probs_loss = torch.tensor(0.0, device=device)
-                             # mirror train: weighted classification sub-loss
-                             loss_val = loss_val + class_weight * (class_loss + class_weight * class_probs_loss)
+                         # combined Dice+CE loss for validation; seg_targets has channel dimension
+                         loss_val = args.lambda_dice * criterion(seg_logits, seg_targets)
                          val_loss += loss_val.item()
                     except Exception as e: print(f"Validation loss error: {e}"); continue
 
                     try: # Validation Metric
                          # Compute Dice with monai metric
                          try:
-                             # Convert logits to predicted classes
-                             val_outputs_seg_labels = torch.argmax(seg_logits, dim=1, keepdim=True)
-                             
-                             # Create one-hot encoded tensors for DiceMetric
-                             # num_classes should be exactly 3 for our task
-                             val_outputs_one_hot = one_hot(val_outputs_seg_labels, num_classes=args.num_seg_classes)
-                             seg_targets_onehot = one_hot(seg_targets, num_classes=args.num_seg_classes)
-                             
-                             # For every 10th batch, print detailed info about class distributions
-                             if val_steps % 10 == 0:
-                                 # Check classes in predictions and targets
-                                 print(f"\nBatch {val_steps} Segmentation Classes:")
-                                 print(f"  Predicted classes: {torch.unique(val_outputs_seg_labels).cpu().numpy()}")
-                                 print(f"  Target classes: {torch.unique(seg_targets).cpu().numpy()}")
-                                 
-                                 # Count pixels per class
-                                 for c in range(args.num_seg_classes):
-                                     pred_count = (val_outputs_seg_labels == c).sum().item()
-                                     target_count = (seg_targets == c).sum().item()
-                                     print(f"  Class {c}: Pred={pred_count}, Target={target_count}")
-                             
                              # Compute dice using MONAI's metric
-                             dice_metric(y_pred=val_outputs_one_hot, y=seg_targets_onehot)
+                             dice_metric(y_pred=seg_logits, y=seg_targets)
                          except Exception as dice_err:
                              print(f"Error computing dice metric: {dice_err}")
                              import traceback
                              print(traceback.format_exc())
                          
-                         # Update class accuracy EMAs
-                         if class_logits is not None:
-                             class_accs = val_accuracy_tracker.update(class_logits, class_targets)
-                             # compute per-class segmentation pixel accuracy
-                             seg_preds = torch.argmax(seg_logits, dim=1)  # [B, D, H, W]
-                             seg_t = seg_targets.squeeze(1)
-                             acc1 = ((seg_preds == 1) & (seg_t == 1)).sum().float() / ((seg_t == 1).sum().float().clamp(min=1))
-                             acc2 = ((seg_preds == 2) & (seg_t == 2)).sum().float() / ((seg_t == 2).sum().float().clamp(min=1))
-                             val_pbar.set_postfix(
-                                 val_loss=f"{loss_val.item():.4f}",
-                                 class1_head_acc=f"{class_accs.get(1, 0):.4f}",
-                                 class2_head_acc=f"{class_accs.get(2, 0):.4f}",
-                                 seg1_acc=f"{acc1.item():.4f}",
-                                 seg2_acc=f"{acc2.item():.4f}"
-                             )
-                             
-                             # Store predictions and targets for confusion matrix and classification report
-                             class_preds = torch.argmax(class_logits, dim=1).cpu().numpy()
-                             class_targets_np = class_targets.cpu().numpy()
-                             all_class_preds.extend(class_preds)
-                             all_class_targets.extend(class_targets_np)
-                             
                     except Exception as e: 
                         print(f"Validation metrics error: {e}")
                         continue
@@ -1232,45 +902,19 @@ def main(args):
                 # Store for metrics tracking, etc.
                 metric_val = float(mean_dice)
             else:
-                dice_scores = np.zeros(args.num_seg_classes)
+                dice_scores = np.zeros(1)
                 metric_val = 0.0
             
             log_memory(f"Epoch {epoch} Val End")
             
             print(f"\n--- Epoch {epoch} Validation Summary ---")
             print(f"Avg Val Loss: {avg_val_loss:.4f}, Mean Dice: {metric_val:.4f}")
-            print(f"Class EMA Accuracies: {val_accuracy_tracker.get_accuracy_string()}")
-            
-            # Generate comprehensive reports if we collected data
-            if all_class_preds and all_class_targets:
-                try:
-                    # Classification metrics report
-                    cm = confusion_matrix(all_class_targets, all_class_preds)
-                    class_report = classification_report(all_class_targets, all_class_preds, digits=4)
-                    
-                    print("\n=== CLASSIFICATION REPORT ===")
-                    print(f"Confusion Matrix (rows=true, cols=pred):")
-                    print(cm)
-                    print("\nDetailed Classification Report:")
-                    print(class_report)
-                    
-                    # Basic per-class metrics
-                    for cls in [1, 2]:
-                        if cls in np.unique(all_class_targets) or cls in np.unique(all_class_preds):
-                            precision = cm[cls,cls] / np.sum(cm[:,cls]) if np.sum(cm[:,cls]) > 0 else 0
-                            recall = cm[cls,cls] / np.sum(cm[cls,:]) if np.sum(cm[cls,:]) > 0 else 0
-                            print(f"Class {cls} Precision: {precision:.4f}, Recall: {recall:.4f}")
-                except Exception as e:
-                    print(f"Error generating classification report: {e}")
             
             # Segmentation metrics report
             print("\n=== SEGMENTATION REPORT ===")
-            print("Per-class Dice scores:")
-            for i in range(args.num_seg_classes):
-                if i < len(dice_scores):
-                    print(f"  Class {i}: {dice_scores[i]:.4f}")
-                else:
-                    print(f"  Class {i}: N/A")
+            # Report Dice score for foreground (class 1)
+            if len(dice_scores) > 0:
+                print(f"Dice score: {dice_scores[0]:.4f}")
             
             # Add class distribution in ground truth segmentation masks
             try:
@@ -1278,7 +922,7 @@ def main(args):
                 sample_size = min(50, len(test_files))
                 sample_files = random.sample(test_files, sample_size)
                 
-                class_pixel_counts = np.zeros(args.num_seg_classes)
+                class_pixel_counts = np.zeros(1)
                 total_pixels = 0
                 
                 for i, sample in enumerate(tqdm(sample_files, desc="Analyzing validation masks")):
@@ -1291,7 +935,7 @@ def main(args):
                         seg_data_remapped[seg_data_remapped == 3] = 0
                         
                         # Count pixels per class
-                        for c in range(args.num_seg_classes):
+                        for c in range(1):
                             class_pixel_counts[c] += np.sum(seg_data_remapped == c)
                         total_pixels += seg_data_remapped.size
                     except Exception as e:
@@ -1299,20 +943,27 @@ def main(args):
                 
                 # Report class distributions
                 print(f"\nAnalyzed {sample_size} validation masks")
-                for c in range(args.num_seg_classes):
+                for c in range(1):
                     percentage = (class_pixel_counts[c] / total_pixels) * 100 if total_pixels > 0 else 0
                     print(f"  Class {c}: {class_pixel_counts[c]:.0f} pixels ({percentage:.4f}%)")
             except Exception as e:
                 print(f"Error analyzing validation masks: {e}")
             
-            # Class distribution in validation set
+            # Class distribution in validation set (image-level presence)
             print("\nClass Distribution in Validation Set (Image Level):")
-            class_presence_counts = {cls: 0 for cls in range(args.num_seg_classes)}
-            for cls_target in all_class_targets:
-                class_presence_counts[cls_target] += 1
-            
+            # compute presence counts for background (0) and foreground (1)
+            num_samples = seg_targets.shape[0]
+            class_presence_counts = {0: 0, 1: 0}
+            # seg_targets shape [B,1,D,H,W], squeeze to [B,D,H,W]
+            for sample in seg_targets.squeeze(1):
+                # find unique classes in this sample
+                unique_cls = torch.unique(sample).cpu().tolist()
+                for c in unique_cls:
+                    if c in class_presence_counts:
+                        class_presence_counts[c] += 1
+
             for cls, count in class_presence_counts.items():
-                percentage = (count / len(all_class_targets)) * 100 if all_class_targets else 0
+                percentage = (count / num_samples) * 100 if num_samples > 0 else 0
                 print(f"Class {cls}: {count} samples ({percentage:.2f}%)")
 
             if wandb_enabled:
@@ -1321,10 +972,6 @@ def main(args):
                     "val/epoch_mean_dice": metric_val, 
                     "epoch": epoch
                 }
-                # Add class accuracies to wandb
-                for cls in [1, 2]:
-                    if cls in val_accuracy_tracker.class_ema:
-                        wandb_data[f"val/epoch_cls{cls}_acc_ema"] = val_accuracy_tracker.class_ema[cls]
                 
                 # Add MONAI Dice scores if available
                 if val_steps > 0 and len(dice_scores) > 0:
@@ -1332,15 +979,15 @@ def main(args):
                     wandb_data["val/mean_dice"] = metric_val
                     
                     # Log per-class dice scores
-                    for i in range(min(args.num_seg_classes, len(dice_scores))):
+                    for i in range(min(1, len(dice_scores))):
                         wandb_data[f"val/dice_class_{i}"] = dice_scores[i]
                 
                 wandb.log(wandb_data, step=(epoch+1)*MAX_STEPS_PER_EPOCH -1)
 
-            # --- Checkpointing (Based on Mean Dice) ---
-            is_best = metric_val > best_metric
-            if is_best: best_metric = metric_val; best_metric_epoch = epoch
-            print(f" Current Val Dice: {metric_val:.4f}, Best Val Dice: {best_metric:.4f} at Epoch {best_metric_epoch}")
+            # --- Checkpointing (Based on Average Val Loss) ---
+            is_best = avg_val_loss < best_metric
+            if is_best: best_metric = avg_val_loss; best_metric_epoch = epoch
+            print(f" Current Val Loss: {avg_val_loss:.4f}, Best Val Loss: {best_metric:.4f} at Epoch {best_metric_epoch}")
             latest_save_path = run_output_dir / 'checkpoint_latest.pt'
             chkpt = {'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'best_metric': best_metric, 'best_metric_epoch': best_metric_epoch}
             torch.save(chkpt, latest_save_path)
@@ -1368,8 +1015,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=12, help="Num workers for MTA")
     parser.add_argument('--num_workers_val', type=int, default=4, help="Num workers for MONAI val loader")
 
-    parser.add_argument('--num_seg_classes', type=int, required=True, help="Number of segmentation output classes (e.g., 3 for Bkg, Art1, Art2).")
-    parser.add_argument('--input_size', type=int, nargs=3, default=[64, 192, 192+32])
+    parser.add_argument('--num_seg_classes', type=int,default=1, required=False, help="Number of segmentation output classes (e.g., 3 for Bkg, Art1, Art2).")
+    parser.add_argument('--input_size', type=int, nargs=3, default=[64, 192+32, 192+64])
     parser.add_argument('--target_spacing', type=float, nargs=3, default=[1, 1, 1])
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=4)
@@ -1383,7 +1030,7 @@ if __name__ == "__main__":
     parser.add_argument('--nesterov', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--scheduler_T0', type=int, default=10) # Added scheduler args
     parser.add_argument('--scheduler_T_mult', type=int, default=2)
-    parser.add_argument('--lambda_ce', type=float, default=1.8)
+    parser.add_argument('--lambda_ce', type=float, default=1.0)
     parser.add_argument('--lambda_dice', type=float, default=1.0)
 
     # Removed classification specific args like --num_classes, --use_weighted_loss, --class_weights
@@ -1398,6 +1045,7 @@ if __name__ == "__main__":
     parser.add_argument('--log_freq', type=int, default=100)
     parser.add_argument('--no_wandb', action='store_true')
     parser.add_argument('--wandb_project', type=str, default='ArtifactSegmentation') # Changed default project
+    parser.add_argument('--run_name', type=str, default=None, help="Name of existing run to resume, overrides default run name.")
 
     args = parser.parse_args()
 
@@ -1406,6 +1054,7 @@ if __name__ == "__main__":
     cli_args = args
 
     # Basic validation
-    if args.num_seg_classes <= 1: raise ValueError("num_seg_classes must be >= 2.")
+    # Allow single-class segmentation
+    # (args.num_seg_classes may be unused downstream now)
 
     main(args)

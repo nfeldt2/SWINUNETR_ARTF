@@ -256,8 +256,8 @@ class SwinUNETR(nn.Module):
             res_block=True,
         )
 
-        # Main output block (highest resolution)
-        self.final_out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=self.num_classification_outputs)
+        # Main segmentation output block (highest resolution)
+        self.final_out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
 
         # --- Deep Supervision Heads (if enabled) ---
         if self.deep_supervision:
@@ -266,7 +266,7 @@ class SwinUNETR(nn.Module):
             self.ds_3 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 4, out_channels=1) # From decoder3 output
             self.ds_4 = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size * 8, out_channels=1) # From decoder4 output
 
-        self.num_classes_classification = num_classification_outputs # Binary: Class 1 vs Not Class 1
+        self.num_classes_classification = num_classification_outputs # used by classification head
         # Example classification head (adjust based on bottleneck feature size: 16 * feature_size)
         bottleneck_features = 16 * feature_size
         self.classification_gap = nn.AdaptiveAvgPool3d(4) # Global Average Pooling
@@ -305,15 +305,13 @@ class SwinUNETR(nn.Module):
 
         # --- Segmentation Pathway (continues as before) ---
         dec3 = self.decoder5(dec4, hidden_states_out[3])
-        dec3 = self.decoder5(dec4, hidden_states_out[3])
         dec2 = self.decoder4(dec3, enc3)
         dec1 = self.decoder3(dec2, enc2)
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
 
-        segmentation_logits = self.final_out(out) # Assuming 'out' is the final decoder output before this
+        segmentation_logits = self.final_out(out) # single call to segmentation head
 
-        
         # Apply skip connections from initial encoders
         out = self.final_out(out) 
 
